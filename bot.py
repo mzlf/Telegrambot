@@ -1,4 +1,3 @@
-import os
 import time
 import telebot
 import threading
@@ -6,10 +5,7 @@ import re
 from playwright.sync_api import sync_playwright
 
 # --- КОНФИГУРАЦИЯ ---
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CITY = os.getenv("DTEK_CITY") 
-STREET = os.getenv("DTEK_STREET")
-HOUSE = os.getenv("DTEK_HOUSE")
+TOKEN = "8702758834:AAHbQNtVyNl85z2xtPiuHlAbUfPSBqtCshA"
 bot = telebot.TeleBot(TOKEN)
 
 # Глобальные объекты управления
@@ -51,9 +47,10 @@ def get_dtek_analysis(day_type="today"):
                     p.locator(s).first.click(force=True)
 
                 # Заполнение адреса
-                    safe_fill(page, "input[name='city']", CITY, "city")
-                    safe_fill(page, "input[name='street']", STREET, "street")
-                    safe_fill(page, "input#house_num, input[name='house']", HOUSE, "house_num")
+                safe_fill(page, "input[name='city']", "с. Мала Михайлівка", "city")
+                safe_fill(page, "input[name='street']", "вул. Бесарабська", "street")
+                safe_fill(page, "input#house_num, input[name='house']", "32/", "house_num")
+
                 # Ждем таблицу
                 page.wait_for_selector("#discon-fact", timeout=20000)
                 
