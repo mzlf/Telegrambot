@@ -1,20 +1,23 @@
 import time
 import telebot
 import threading
+import re
 from playwright.sync_api import sync_playwright
 
 # --- КОНФИГУРАЦИЯ ---
 TOKEN = "8702758834:AAHbQNtVyNl85z2xtPiuHlAbUfPSBqtCshA"
 bot = telebot.TeleBot(TOKEN)
 
-# Глобальные объекты
-active_users = set()       # Кто в процессе парсинга сейчас
-last_request_time = {}     # Время последнего запроса для КД (user_id: timestamp)
+# Глобальные объекты управления
+active_users = set()       # Кто сейчас в процессе ручного запроса
+monitoring_users = set()   # У кого включен авто-мониторинг
+last_known_data = {}       # Последние данные для сравнения (user_id: text)
+last_request_time = {}     # Время последнего клика для КД
 users_lock = threading.Lock()
-browser_lock = threading.Lock() # Строго по очереди для стабильности на сайте
+browser_lock = threading.Lock() # Строго по очереди для стабильности
 
 def get_dtek_analysis(day_type="today"):
-    """Запуск браузера и парсинг"""
+    """Запуск браузера и парсинг данных с маскировкой под человека"""
     with browser_lock:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
@@ -37,29 +40,37 @@ def get_dtek_analysis(day_type="today"):
                     f.click(force=True)
                     p.keyboard.press("Control+A")
                     p.keyboard.press("Backspace")
-                    f.type(value)
+                    f.type(value, delay=150)
+                    time.sleep(2)
                     p.keyboard.press("ArrowDown")
                     s = f"#{list_id}autocomplete-list div, .autocomplete-suggestion:visible"
                     p.wait_for_selector(s, state="visible", timeout=15000)
                     p.locator(s).first.click(force=True)
+                    time.sleep(2)
 
+                # Заполнение адреса
                 safe_fill(page, "input[name='city']", "с. Мала Михайлівка", "city")
                 safe_fill(page, "input[name='street']", "вул. Бесарабська", "street")
-                safe_fill(page, "input#house_num, input[name='house']", "32/", "house_num")
+                safe_fill(page, "input#house_num, input[name='house']", "32/a", "house_num")
 
-                table_path = "#discon-fact > div.discon-fact-tables > div.discon-fact-table.active > table"
-                page.wait_for_selector(table_path, timeout=20000)
+                # Ждем таблицу
+                page.wait_for_selector("#discon-fact", timeout=20000)
                 
                 if day_type == "tomorrow":
                     tab = page.locator("#discon-fact > div.dates > div:nth-child(2)")
-                    if not tab.is_visible(): return "График на завтра еще не опубликован."
+                    if not tab.is_visible(): return {"update_time": "Неизвестно", "schedule": "График на завтра еще не опубликован."}
                     tab.click(force=True)
                     time.sleep(2)
 
+                # JS АНАЛИЗАТОР (Дата обновления + График)
                 analysis_script = """
                 () => {
+                    const updateTimeElem = document.querySelector("#discon-fact > div.discon-fact-info > span.discon-fact-info-text");
+                    const updateTime = updateTimeElem ? updateTimeElem.innerText.replace("Дата та час останнього оновлення інформації на графіку:", "").trim() : "Неизвестно";
+
                     const row = document.querySelector("#discon-fact > div.discon-fact-tables > div.discon-fact-table.active > table > tbody > tr");
-                    if (!row) return "График не найден.";
+                    if (!row) return { update_time: updateTime, schedule: "График не найден." };
+                    
                     const cells = Array.from(row.querySelectorAll("td")).slice(1, 25);
                     let intervals = [];
                     cells.forEach((cell, index) => {
@@ -68,20 +79,24 @@ def get_dtek_analysis(day_type="today"):
                         else if (cell.classList.contains('cell-first-half')) intervals.push({start: hour, end: hour + 0.5});
                         else if (cell.classList.contains('cell-second-half')) intervals.push({start: hour + 0.5, end: hour + 1});
                     });
-                    if (intervals.length === 0) return "✅ Свет отключать не планируют.";
+
+                    if (intervals.length === 0) return { update_time: updateTime, schedule: "✅ Свет отключать не планируют." };
+
                     let merged = [];
-                    let current = intervals[0];
+                    let current = { ...intervals[0] };
                     for (let i = 1; i < intervals.length; i++) {
                         if (intervals[i].start === current.end) current.end = intervals[i].end;
-                        else { merged.push(current); current = intervals[i]; }
+                        else { merged.push(current); current = { ...intervals[i] }; }
                     }
                     merged.push(current);
+
                     const fmt = (t) => {
                         let h = Math.floor(t).toString().padStart(2, '0');
                         let m = (t % 1) === 0 ? "00" : "30";
                         return h + ":" + m;
                     };
-                    return merged.map(i => "🔴 <b>" + fmt(i.start) + " — " + fmt(i.end) + "</b>").join('\\n');
+                    const res = merged.map(i => "🔴 <b>" + fmt(i.start) + " — " + fmt(i.end) + "</b>").join('\\n');
+                    return { update_time: updateTime, schedule: res };
                 }
                 """
                 result = page.evaluate(analysis_script)
@@ -89,56 +104,81 @@ def get_dtek_analysis(day_type="today"):
                 return result
             except Exception as e:
                 browser.close()
-                return f"Ошибка: {str(e)}"
+                return {"update_time": "Ошибка", "schedule": f"Ошибка: {str(e)}"}
+
+def monitoring_worker(uid, cid):
+    """Фоновая задача проверки обновлений раз в 5 минут"""
+    while uid in monitoring_users:
+        try:
+            data = get_dtek_analysis("today")
+            full_text = f"🕒 <b>Обновлено на сайте:</b> {data['update_time']}\n\n{data['schedule']}"
+            
+            # Если данные изменились - уведомляем
+            if uid not in last_known_data or last_known_data[uid] != full_text:
+                last_known_data[uid] = full_text
+                bot.send_message(cid, f"🔔 <b>ВНИМАНИЕ! График изменился:</b>\n\n{full_text}", parse_mode="HTML")
+        except: pass
+        time.sleep(300) # 5 минут
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("Сегодня 💡", "Завтра 📅", "Мониторинг 📡")
+    bot.send_message(message.chat.id, "Бот готов. Выберите действие:", reply_markup=markup)
 
 @bot.message_handler(func=lambda m: True)
-def handle_message(message):
+def handle_all(message):
     uid = message.from_user.id
-    current_time = time.time()
-    text = message.text.lower() # Переводим в нижний регистр для удобства
+    cid = message.chat.id
+    text = message.text
 
-    # 1. Проверяем, что текст сообщения нам подходит
-    if "сьогодні" in text or "сегодня" in text or "💡" in text:
-        day = "today"
-    elif "завтра" in text or "📅" in text:
-        day = "tomorrow"
-    else:
-        # Если юзер написал что-то другое
-        bot.reply_to(message, "❓ Я тебя не понимаю. Нажми на кнопку в меню или напиши 'Сегодня'/'Завтра'.")
-        return # Выходим из функции, браузер не запустится
-        # 1. ПРОВЕРКА КД (10 секунд)
-    if uid in last_request_time:
-        elapsed = current_time - last_request_time[uid]
-        if elapsed < 10:
-            remaining = int(10 - elapsed)
-            bot.reply_to(message, f"⚠️ Не спеши! Подожди еще {remaining} сек.")
-            return
+    # 1. Логика кнопки Мониторинг
+    if text == "Мониторинг 📡":
+        with users_lock:
+            if uid in monitoring_users:
+                monitoring_users.remove(uid)
+                bot.reply_to(message, "📴 Мониторинг выключен.")
+            else:
+                monitoring_users.add(uid)
+                bot.reply_to(message, "📡 Мониторинг включен! Проверяю каждые 5 минут. Пришлю сообщение, если график изменится.")
+                threading.Thread(target=monitoring_worker, args=(uid, cid), daemon=True).start()
+        return
 
-    # 2. ПРОВЕРКА АКТИВНОГО ПРОЦЕССА
+    # 2. Проверка на мусорные сообщения
+    if not any(x in text for x in ["Сегодня", "Завтра", "💡", "📅"]):
+        bot.reply_to(message, "🤖 Нажми на кнопки Сегодня/Завтра или Мониторинг.")
+        return
+
+    # 3. Кулдаун 10 секунд
+    now = time.time()
+    if uid in last_request_time and now - last_request_time[uid] < 10:
+        bot.reply_to(message, f"⚠️ Подожди {int(10 - (now - last_request_time[uid]))} сек.")
+        return
+
+    # 4. Запуск парсинга в отдельном потоке
     with users_lock:
         if uid in active_users:
-            bot.reply_to(message, "⏳ Твой запрос уже обрабатывается!")
+            bot.reply_to(message, "⏳ Твой запрос уже в очереди!")
             return
         active_users.add(uid)
 
-    # Обновляем время последнего запроса
-    last_request_time[uid] = current_time
+    last_request_time[uid] = now
 
     def task():
         try:
-            day = "tomorrow" if "Завтра" in message.text else "today"
-            status = bot.send_message(message.chat.id, f"🔍 Запрашиваю данные (в очереди)...")
+            day = "tomorrow" if "Завтра" in text else "today"
+            status = bot.send_message(cid, f"🔍 Считываю таблицу (в очереди)...")
             
-            result_text = get_dtek_analysis(day)
-            final_message = f"<b>📢 График на {message.text.lower()}:</b>\n\n{result_text}"
+            data = get_dtek_analysis(day)
+            response = f"<b>🕒 Обновлено:</b> {data['update_time']}\n\n<b>📢 График на {text.lower()}:</b>\n\n{data['schedule']}"
             
-            bot.edit_message_text(final_message, message.chat.id, status.message_id, parse_mode="HTML")
+            bot.edit_message_text(response, cid, status.message_id, parse_mode="HTML")
+            last_known_data[uid] = response # Запоминаем для мониторинга
         except Exception as e:
-            bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+            bot.send_message(cid, f"❌ Ошибка: {e}")
         finally:
             with users_lock:
-                if uid in active_users:
-                    active_users.remove(uid)
+                if uid in active_users: active_users.remove(uid)
 
     threading.Thread(target=task).start()
 
