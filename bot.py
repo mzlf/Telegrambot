@@ -143,5 +143,4 @@ def handle_message(message):
     threading.Thread(target=task).start()
 
 if __name__ == "__main__":
-    bot.remove_webhook(drop_pending_updates=True)
     bot.polling(none_stop=True)
