@@ -3,3 +3,6 @@ nixPkgs = ["python311", "glib", "nss", "nspr", "atk", "at-spi2-atk", "libdrm", "
 
 [phases.build]
 cmds = ["pip install -r requirements.txt", "playwright install chromium"]
+
+[start]
+cmd = "python bot.py"
