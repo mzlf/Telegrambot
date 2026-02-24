@@ -26,7 +26,7 @@ def get_dtek_full_data():
     """Заходит один раз и берет данные за сегодня и завтра"""
     with browser_lock:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             page = context.new_page()
             # Оставляем CSS для работы выпадающих списков
