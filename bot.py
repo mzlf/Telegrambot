@@ -17,19 +17,19 @@ users_lock = threading.Lock()
 browser_lock = threading.Lock() # Строго по очереди для стабильности
 
 def get_dtek_analysis(day_type="today"):
-    """Запуск браузера и парсинг данных с маскировкой под человека"""
     with browser_lock:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
-            context = browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            )
+            # Используем запуск без графики и с оптимизацией
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
+            context = browser.new_context(user_agent="...")
             page = context.new_page()
-            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            
+            # ОТКЛЮЧАЕМ КАРТИНКИ И СТИЛИ
+            page.route("**/*.{png,jpg,jpeg,css,woff,woff2}", lambda route: route.abort())
 
             try:
-                page.goto("https://www.dtek-krem.com.ua/ua/shutdowns", wait_until="networkidle", timeout=60000)
+                # Уменьшаем время ожидания загрузки всей страницы
+                page.goto("https://www.dtek-krem.com.ua/ua/shutdowns", wait_until="commit", timeout=30000)
                 try: page.click("button.modal__close", timeout=5000)
                 except: pass
 
@@ -38,10 +38,7 @@ def get_dtek_analysis(day_type="today"):
                     f.wait_for(state="visible", timeout=15000)
                     f.scroll_into_view_if_needed()
                     f.click(force=True)
-                    p.keyboard.press("Control+A")
-                    p.keyboard.press("Backspace")
-                    f.type(value)
-                    p.keyboard.press("ArrowDown")
+                    f.fill(value)
                     s = f"#{list_id}autocomplete-list div, .autocomplete-suggestion:visible"
                     p.wait_for_selector(s, state="visible", timeout=15000)
                     p.locator(s).first.click(force=True)
