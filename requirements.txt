@@ -1,2 +1,4 @@
-pyTelegramBotAPI
+aiogram
 playwright
+pytz
+upstash-redis
