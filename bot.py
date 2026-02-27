@@ -274,20 +274,20 @@ async def monitoring_task():
                     
                     # Шапка уведомления
                     msg = "🔔 <b>ГРАФИК ИЗМЕНИЛСЯ!!</b>\n"
-                    msg += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n"
+                    msg += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
 
                     # Графики (делаем моноширинными через <code>)
                     for r in sorted(schedules.keys()):
                         msg += f"📅 <b>{schedules[r]['dateText']}</b>\n"
-                        msg += f"<code>{schedules[r]['schedule']}</code>\n\n"
+                        msg += f"<code>{schedules[r]['schedule']}</code>\n"
                     
                     msg += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
                     
                     # Техническая инфа (время обновления)
                     raw_time = list(schedules.values())[0]['updateTime']
                     clean_time = raw_time.split(": ")[-1] if ": " in raw_time else raw_time
-                    msg += f"🕒 Обновлено: <code>{clean_time}</code>\n"
                     msg += ans                    
+                    msg += f"🕒 Обновлено: <code>{clean_time}</code>\n"
                     try:
                         await bot.send_message(int(uid), msg, parse_mode="HTML")
                         logging.info(f"✅ Отправлено уведомление юзеру {uid}")
@@ -314,22 +314,22 @@ async def manual(m: types.Message):
     
     # Заголовок
     full_text = "💡 <b>Актуальный График</b> 💡\n"
-    full_text += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n"
+    full_text += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
     
     # Графики
     for rel in sorted(schedules.keys()):
         d = schedules[rel]
         full_text += f"⚡ <b>{d['dateText']}</b>\n"
-        full_text += f"<code>{d['schedule']}</code>\n\n"
+        full_text += f"<code>{d['schedule']}</code>\n"
 
     full_text += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
     
     # Время обновления
     raw_time = list(schedules.values())[0]['updateTime']
     clean_time = raw_time.split(": ")[-1] if ": " in raw_time else raw_time
-    full_text += f"🕒 Обновлено: <code>{clean_time}</code>\n"
     
     full_text += ans
+    full_text += f"🕒 <b>Обновлено:</b> <code>{clean_time}</code>\n"
     
     await msg.edit_text(full_text, parse_mode="HTML")
 def get_kb(uid):
