@@ -61,7 +61,7 @@ analysis_script = """
     let cur = raw_statuses[0], start = 0;
     for (let i = 1; i <= 48; i++) {
         if (i === 48 || raw_statuses[i] !== cur) {
-            intervals.push(cur + " <b>" + fmt(start) + " — " + (i === 48 ? "00:00" : fmt(i)) + "</b> " + cur);
+            intervals.push(cur + " <b>" + fmt(start) + " — " + (i === 48 ? "00:00" : fmt(i)) + "</b>");
             if(i < 48) { cur = raw_statuses[i]; start = i; }
         }
     }
@@ -203,7 +203,7 @@ def calculate_time_left(schedules):
             break
             
     if first_change_idx == -1:
-        return f"<b>  Сейчас</b> {current_state}. В ближайшие сутки изменений не планируется."
+        return f"<blockquote>✨До конца дня отключений не планируется✨</blockquote>\n"
 
     # Расчет времени до 1-го события
     diff1 = (first_change_idx * 30) - minutes_now
@@ -287,7 +287,7 @@ async def monitoring_task():
                     raw_time = list(schedules.values())[0]['updateTime']
                     clean_time = raw_time.split(": ")[-1] if ": " in raw_time else raw_time
                     msg += ans                    
-                    msg += f"🕒 Обновлено: <code>{clean_time}</code>\n"
+                    msg += f"🕒 <b>Обновлено:</b> <code>{clean_time}</code>\n"
                     try:
                         await bot.send_message(int(uid), msg, parse_mode="HTML")
                         logging.info(f"✅ Отправлено уведомление юзеру {uid}")
