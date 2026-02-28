@@ -203,7 +203,7 @@ def calculate_time_left(schedules):
             break
             
     if first_change_idx == -1:
-        return f"<blockquote>✨До конца дня отключений не планируется✨</blockquote>\n"
+        return f"<blockquote>✨Сегодня без отключений✨</blockquote>\n"
 
     # Расчет времени до 1-го события
     diff1 = (first_change_idx * 30) - minutes_now
