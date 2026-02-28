@@ -278,7 +278,7 @@ async def monitoring_task():
 
                     # Графики (делаем моноширинными через <code>)
                     for r in sorted(schedules.keys()):
-                        msg += f"📅 <b>{schedules[r]['dateText']}</b>\n"
+                        msg += f"⚡<b>{schedules[r]['dateText']}</b>⚡\n"
                         msg += f"<code>{schedules[r]['schedule']}</code>\n"
                     
                     msg += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
@@ -313,13 +313,13 @@ async def manual(m: types.Message):
     ans = calculate_time_left(schedules)   
     
     # Заголовок
-    full_text = "💡 <b>Актуальный График</b> 💡\n"
+    full_text = "💡<b>Актуальный График</b>💡\n"
     full_text += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
     
     # Графики
     for rel in sorted(schedules.keys()):
         d = schedules[rel]
-        full_text += f"⚡ <b>{d['dateText']}</b>\n"
+        full_text += f"⚡<b>{d['dateText']}</b>⚡\n"
         full_text += f"<code>{d['schedule']}</code>\n"
 
     full_text += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
