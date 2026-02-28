@@ -334,7 +334,7 @@ async def manual(m: types.Message):
     await msg.edit_text(full_text, parse_mode="HTML")
 def get_kb(uid):
     return types.ReplyKeyboardMarkup(
-        keyboard=[[types.KeyboardButton(text="Показать график 💡")], [types.KeyboardButton(text="Вкл/Выкл мониторинг 📡")]], 
+        keyboard=[[types.KeyboardButton(text="⚡ Показать график")], [types.KeyboardButton(text="🔔 Мониторинг")]], 
         resize_keyboard=True
     )
 
@@ -351,6 +351,19 @@ async def toggle(m: types.Message):
     else:
         redis.sadd("monitoring_users", uid)
         await m.answer("Мониторинг включен.")
+@dp.message(F.text)
+async def default_handler(m: types.Message):
+    kb = [
+        [types.KeyboardButton(text="⚡ Показать график")],
+        [types.KeyboardButton(text="🔔 Мониторинг")]
+    ]
+    keyboard = types.ReplyKeyboardMarkup(
+        keyboard=kb,
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие в меню 👇"
+    )
+    
+    await m.answer("Пожалуйста, выберите действие из меню ниже:", reply_markup=keyboard)
 
 async def main():   
     await start_browser()
