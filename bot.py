@@ -61,7 +61,7 @@ analysis_script = """
     let cur = raw_statuses[0], start = 0;
     for (let i = 1; i <= 48; i++) {
         if (i === 48 || raw_statuses[i] !== cur) {
-            intervals.push(cur + " <b>" + fmt(start) + " — " + (i === 48 ? "00:00" : fmt(i)) + "</b>" + cur);
+            intervals.push(cur + "<b>" + fmt(start) + " — " + (i === 48 ? "00:00" : fmt(i)) + "</b>" + cur);
             if(i < 48) { cur = raw_statuses[i]; start = i; }
         }
     }
