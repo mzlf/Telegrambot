@@ -210,7 +210,7 @@ def calculate_time_left(schedules):
     h1, m1 = diff1 // 60, diff1 % 60
     action1 = "<b>Включение через:</b>" if current_state == "🔴" else "<b>Выключение через:</b>"
     
-    res = f"<blockquote>💡<b>Статус:</b>{current_state}💡</blockquote>\n<b><i>⏳</i>{action1}</b> <b>{h1}</b><b>ч</b> <b>{m1}</b> <b>минут</b><b>.</b>"
+    res = f"<blockquote>💡<b>Статус:</b>{current_state}💡</blockquote>\n<b><i>⏳</i>{action1}</b> <b>{h1}</b><b>ч</b> <b>{m1}</b> <b>минут</b><b>.</b>\n"
     # --- 2. Ищем ВТОРОЕ изменение (следующее за первым) ---
     second_change_idx = -1
     next_state = full_timeline[first_change_idx]
