@@ -261,7 +261,7 @@ def calculate_time_left(schedules):
             h, m = diff // 60, diff % 60
             
             label = "<b>До включения</b>" if full_timeline[i] == "🟢" else "<b>До выключения</b>"
-            events.append(f" >↳ {label}: {format_time(h, m)}")
+            events.append(f" ↳ {label}: {format_time(h, m)}")
             
             temp_state = full_timeline[i]
             if len(events) >= 2: # Нам нужно только два ближайших события
