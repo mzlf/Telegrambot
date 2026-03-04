@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import pytz
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from upstash_redis import Redis
 from playwright.async_api import async_playwright
 
@@ -24,9 +25,9 @@ logging.basicConfig(level=logging.INFO)
 # Переменные браузера
 playwright = None
 browser = None
-# Две отдельные страницы и два замка
 page_monitor = None
 page_user = None
+current_attention_text = "Актуальних повідомлень немає."
 lock_monitor = asyncio.Lock()
 lock_user = asyncio.Lock()
 
@@ -42,10 +43,17 @@ analysis_script = """
     const dateId = activeTab ? activeTab.getAttribute("rel") : null;
     const dateTextElem = activeTab ? activeTab.querySelector("div:nth-child(2)") : null;
     const dateText = dateTextElem ? dateTextElem.innerText.trim() : "Графік";
+    
+    // ПАРСИНГ СИНЕГО БЛОКА ВНИМАНИЯ
+    const attentionElem = document.querySelector(".m-attention__text");
+    const attentionText = attentionElem ? attentionElem.innerText.trim() : "Актуальних повідомлень від Укренерго немає.";
+
     const updateTimeElem = document.querySelector("#discon-fact .discon-fact-info-text");
     const updateTime = updateTimeElem ? updateTimeElem.innerText.trim() : "---";
+    
     const row = document.querySelector("#discon-fact .discon-fact-table.active table tbody tr");
-    if (!row) return { dateId, dateText, schedule: "Графік не знайдено", raw_statuses: [], updateTime };
+    if (!row) return { dateId, dateText, schedule: "Графік не знайдено", raw_statuses: [], updateTime, attention: attentionText };
+    
     const cells = Array.from(row.querySelectorAll("td")).slice(1, 25);
     let raw_statuses = [];
     cells.forEach(c => {
@@ -53,6 +61,7 @@ analysis_script = """
         let s2 = (c.classList.contains('cell-scheduled') || c.classList.contains('cell-second-half')) ? "🔴" : "🟢";
         raw_statuses.push(s1, s2);
     });
+
     let intervals = [];
     const fmt = (idx) => {
         let m = idx * 30;
@@ -61,11 +70,11 @@ analysis_script = """
     let cur = raw_statuses[0], start = 0;
     for (let i = 1; i <= 48; i++) {
         if (i === 48 || raw_statuses[i] !== cur) {
-            intervals.push(cur + "<b>" + fmt(start) + " — " + (i === 48 ? "00:00" : fmt(i)) + "</b>" + cur);
+            intervals.push(cur + fmt(start) + " — " + (i === 48 ? "00:00" : fmt(i)) + cur);
             if(i < 48) { cur = raw_statuses[i]; start = i; }
         }
     }
-    return { dateId, dateText, schedule: intervals.join("\\n"), raw_statuses, updateTime };
+    return { dateId, dateText, schedule: intervals.join("\\n"), raw_statuses, updateTime, attention: attentionText };
 }
 """
 clock_frames = ["◐","◓","◑","◒"]
@@ -83,7 +92,7 @@ class ProgressSpinner:
 
     async def _spin(self):
         while self.running:
-            text = f"{clock_frames[self.frame % len(clock_frames)]} {self.stage_text}"
+            text = f"{clock_frames[self.frame % len(clock_frames)]} {self.stage_text} "
             try:
                 await self.message.edit_text(text)
             except:
@@ -98,6 +107,13 @@ class ProgressSpinner:
         self.running = False
         if self.task:
             self.task.cancel()
+
+async def delete_message_after(message: types.Message, sleep_time: int):
+    await asyncio.sleep(sleep_time)
+    try:
+        await message.delete()
+    except Exception:
+        pass
 # =============================
 # 🌐 Логика браузера
 # =============================
@@ -162,20 +178,21 @@ async def fetch_data(p, lock, force=False, progress=None):
     async with lock:
 
         if progress:
-            await progress.update("🌍 Открываю сайт...")
-
+            await progress.update("Открываю сайт...")
+            await asyncio.sleep(.5) # Чтобы было видно стадию
         if force:
             await reload_page(p)
 
         if progress:
-            await progress.update("📅 Получаю вкладки...")
-
+            await progress.update("Получаю вкладки...")
+            await asyncio.sleep(.5)
         tabs = p.locator("#discon-fact .dates .date")
         count = await tabs.count()
 
         if count == 0:
             if progress:
-                await progress.update("🔄 Перезагрузка...")
+                await progress.update("Перезагрузка...")
+                await asyncio.sleep(.5)
             await reload_page(p)
             return await fetch_data(p, lock, False, progress)
 
@@ -183,8 +200,8 @@ async def fetch_data(p, lock, force=False, progress=None):
 
         for i in range(count):
             if progress:
-                await progress.update(f"📊 Обрабатываю день {i+1}/{count}...")
-
+                await progress.update(f"Обрабатываю день {i+1}/{count}...")
+                await asyncio.sleep(.5)
             tab = tabs.nth(i)
             await tab.click(timeout=5000)
             data = await p.evaluate(analysis_script)
@@ -193,11 +210,12 @@ async def fetch_data(p, lock, force=False, progress=None):
                 result[data["dateId"]] = data
 
         if progress:
-            await progress.update("🧠 Анализирую данные...")
+            await progress.update("Анализирую данные...")
+            await asyncio.sleep(.5)
 
         return result        
 def h_str(h):
-        return str(int(h)) if h % 1 == 0 else str(h)
+    return str(int(h)) if h % 1 == 0 else str(h)
 
 # =============================
 # ⏳ Расчет времени
@@ -220,160 +238,136 @@ def calculate_time_left(schedules):
 
     sorted_rels = sorted(schedules.keys())
     today_rel = sorted_rels[0]
-
     raw_today = schedules[today_rel].get('raw_statuses', [])
+    
     if not raw_today:
         return "График на сегодня пуст."
 
-    # Завтра (если есть)
+    # Собираем общую линию времени (сегодня + завтра если есть)
     raw_tomorrow = []
     if len(sorted_rels) > 1:
         raw_tomorrow = schedules[sorted_rels[1]].get('raw_statuses', [])
-
-    # Полная линия времени (сегодня + завтра)
+    
     full_timeline = raw_today + raw_tomorrow
-
     minutes_now = now.hour * 60 + now.minute
     current_idx = minutes_now // 30
-
     if current_idx >= len(raw_today):
         return "Сегодняшний график уже не актуален."
 
     current_state = full_timeline[current_idx]
-
-    # ==============================
-    # 🔎 Поиск первого изменения
-    # ==============================
-    first_change_idx = None
+    
+    # --- Логика поиска изменений ---
+    events = []
+    temp_state = current_state
+    
+    # Ищем два ближайших изменения статуса
     for i in range(current_idx + 1, len(full_timeline)):
-        if full_timeline[i] != current_state:
-            first_change_idx = i
-            break
+        if full_timeline[i] != temp_state:
+            diff = (i * 30) - minutes_now
+            h, m = diff // 60, diff % 60
+            
+            label = "<b>До включения</b>" if full_timeline[i] == "🟢" else "<b>До выключения</b>"
+            events.append(f" >↳ {label}: {format_time(h, m)}")
+            
+            temp_state = full_timeline[i]
+            if len(events) >= 2: # Нам нужно только два ближайших события
+                break
 
-    # Если изменений нет вообще
-    if first_change_idx is None:
-        today_off = raw_today.count("🔴") / 2
-        today_on = raw_today.count("🟢") / 2
+    # --- Сборка сообщения ---
+    status_text = "🔋 Включено" if current_state == "🟢" else "🪫 Отключено"
+    
+    res = f"💡 <b>Текущий статус</b>\n"
+    res += f" ↳ <b>Сейчас</b>: {status_text}\n"
+    
+    # Добавляем найденные события
+    if events:
+        res += "\n".join(events) + "\n"
+    else:
+        res += " ↳ ✨ Отключений не планируется\n"
 
-        res = "<blockquote>✨Сегодня без отключений✨</blockquote>\n"
-        res += f"📊 <b>За сегодня:</b> 🟢 {h_str(today_on)}ч | 🔴 {h_str(today_off)}ч\n"
-
-        if raw_tomorrow:
-            tomorrow_off = raw_tomorrow.count("🔴") / 2
-            tomorrow_on = raw_tomorrow.count("🟢") / 2
-            res += f"📅 <b>За завтра:</b> 🟢 {h_str(tomorrow_on)}ч | 🔴 {h_str(tomorrow_off)}ч\n"
-
-        return res
-
-    # ==============================
-    # ⏳ Первое событие
-    # ==============================
-    diff1 = (first_change_idx * 30) - minutes_now
-    h1, m1 = diff1 // 60, diff1 % 60
-
-    action1 = "🟢 Включение через:" if current_state == "🔴" else "🔴Выключение через:"
-
-    res = (
-        f"<blockquote>💡<b>Статус:</b> {current_state}</blockquote>\n"
-        f"<b>{action1}</b> {format_time(h1, m1)}\n"    
-        )
-
-    # ==============================
-    # 🔎 Второе изменение
-    # ==============================
-    second_change_idx = None
-    next_state = full_timeline[first_change_idx]
-
-    for i in range(first_change_idx + 1, len(full_timeline)):
-        if full_timeline[i] != next_state:
-            second_change_idx = i
-            break
-
-    if second_change_idx is not None:
-        diff2 = (second_change_idx * 30) - minutes_now
-        h2, m2 = diff2 // 60, diff2 % 60
-
-        action2 = "🟢 Включение через:" if next_state == "🔴" else "🔴Выключение через:"
-
-        res +=  f"<b>{action2}</b> {format_time(h2, m2)}\n"
-
-    # ==============================
-    # 📊 Статистика
-    # ==============================
+    # --- Статистика ---
     today_off = raw_today.count("🔴") / 2
     today_on = raw_today.count("🟢") / 2
-
-    res += f"📊 <b>За сегодня:</b> 🟢 {h_str(today_on)}ч | 🔴 {h_str(today_off)}ч\n"
+    
+    res += f"📊 <b>Статистика</b>\n"
+    res += f" ↳ <b>Сегодня</b>: 🔋 {h_str(today_on)} ч | 🪫 {h_str(today_off)} ч\n"
 
     if raw_tomorrow:
         tomorrow_off = raw_tomorrow.count("🔴") / 2
         tomorrow_on = raw_tomorrow.count("🟢") / 2
-        res += f"📅 <b>За завтра:</b> 🟢 {h_str(tomorrow_on)}ч | 🔴 {h_str(tomorrow_off)}ч\n"
+        res += f" ↳ <b>Завтра</b>: 🔋 {h_str(tomorrow_on)} ч | 🪫 {h_str(tomorrow_off)} ч\n"
 
     return res
 # =============================
 # 📡 Мониторинг (КД 60 сек) - ИСПРАВЛЕННЫЙ
 # =============================
 async def monitoring_task():
-    global last_monitor_reload
+    global last_monitor_reload, current_attention_text
     while True:
         try:
-            await asyncio.sleep(300) 
+            await asyncio.sleep(300) # Проверка каждые 5 минут
             users = redis.smembers("monitoring_users")
             if not users: continue
 
             now = datetime.now()
-            should_reload = False
-            # Интервал проверки сайта — 2 минуты
-            if last_monitor_reload is None or (now - last_monitor_reload) > timedelta(seconds=120):
-                should_reload = True
+            should_reload = (last_monitor_reload is None or 
+                           (now - last_monitor_reload) > timedelta(seconds=120))
+            
+            if should_reload:
                 last_monitor_reload = now
 
             schedules = await fetch_data(page_monitor, lock_monitor, force=should_reload)
             if not schedules: continue
 
-            for uid_bytes in users:
-                uid = uid_bytes.decode() if isinstance(uid_bytes, bytes) else uid_bytes
-                has_real_change = False
+            # Проверяем, изменился ли график ХОТЯ БЫ для одного дня в глобальном кэше
+            has_real_change = False
+            for rel, data in schedules.items():
+                cache_key = f"global_sched:{rel}" # Общий ключ для всех
+                cached = redis.get(cache_key)
+                cached_str = cached.decode() if isinstance(cached, bytes) else cached
+
+                if cached_str is not None and cached_str != data["schedule"]:
+                    has_real_change = True
                 
-                for rel, data in schedules.items():
-                    cache_key = f"sched:{uid}:{rel}"
-                    cached = redis.get(cache_key)
-                    cached_str = cached.decode() if isinstance(cached, bytes) else cached
+                # Обновляем глобальный кэш
+                redis.set(cache_key, data["schedule"], ex=172800)
 
-                    
-                    # Если этот день УЖЕ БЫЛ в кэше и график СТАЛ другим — это реальное изменение
-                    if cached_str is not None and cached_str != data["schedule"]:
-                        has_real_change = True
-                    
-                    # Обновляем кэш для этой даты (на 2 дня)
-                    redis.set(cache_key, data["schedule"], ex=172800)
+            # Обновляем общий текст внимания
+            first_day_rel = sorted(schedules.keys())[0]
+            current_attention_text = schedules[first_day_rel].get('attention', "Інформація відсутня.")
 
-                # Отправляем сообщение только если зафиксировано изменение в существующих датах
-                if has_real_change:
-                    ans = calculate_time_left(schedules)
-                    
-                    # Шапка уведомления
-                    msg = "🔔 <b>ГРАФИК ИЗМЕНИЛСЯ!!</b>\n"
-                    msg += "━━━━━━━━━━━━━━━━\n"
+            if has_real_change:
+                logging.info("📢 Зафиксировано изменение графика! Рассылка...")
+                
+                # Формируем ОДНО сообщение для всех
+                ans = calculate_time_left(schedules)
+                unified_schedule = ""
+                for rel in sorted(schedules.keys()):
+                    d = schedules[rel]
+                    unified_schedule += f"⚡{d['dateText']} ⚡\n{d['schedule']}\n\n"
 
-                    # Графики (делаем моноширинными через <code>)
-                    for r in sorted(schedules.keys()):
-                        msg += f"⚡<b>{schedules[r]['dateText']}</b>⚡\n"
-                        msg += f"<code>{schedules[r]['schedule']}</code>\n"
-                    
-                    msg += "━━━━━━━━━━━━━━━━\n"
-                    
-                    # Техническая инфа (время обновления)
-                    raw_time = list(schedules.values())[0]['updateTime']
-                    clean_time = raw_time.split(": ")[-1] if ": " in raw_time else raw_time
-                    msg += ans                    
-                    msg += f"🕒 <b>Обновлено:</b> <code>{clean_time}</code>\n"
+                raw_time = schedules[first_day_rel]['updateTime']
+                clean_time = raw_time.split(": ")[-1] if ": " in raw_time else raw_time
+                
+                msg = (
+                    "🔔 <b>ГРАФИК ИЗМЕНИЛСЯ!!</b>\n"
+                    f"<pre>{unified_schedule.strip()}</pre>\n"
+                    f"{ans}\n"
+                    f"<pre>🕒 Обновлено: {clean_time}</pre>"
+                )
+
+                # Кнопка для всех
+                builder = InlineKeyboardBuilder()
+                builder.row(types.InlineKeyboardButton(text="🔹 Информация на сегодня", callback_data="show_att"))
+
+                # Рассылка по списку юзеров
+                for uid_bytes in users:
+                    uid = uid_bytes.decode() if isinstance(uid_bytes, bytes) else uid_bytes
                     try:
-                        await bot.send_message(int(uid), msg, parse_mode="HTML")
-                        logging.info(f"✅ Отправлено уведомление юзеру {uid}")
+                        await bot.send_message(int(uid), msg, reply_markup=builder.as_markup(), parse_mode="HTML")
+                        await asyncio.sleep(0.05) # Защита от спам-фильтра Telegram
                     except Exception as e:
-                        logging.error(f" Ошибка отправки: {e}")
+                        logging.error(f"Ошибка рассылки юзеру {uid}: {e}")
 
         except Exception as e:
             logging.error(f"⚠️ Ошибка в мониторинге: {e}")
@@ -383,49 +377,60 @@ async def monitoring_task():
 # =============================
 @dp.message(F.text.contains("график") | F.text.contains("Показать"))
 async def manual(m: types.Message):
-
-    msg = await m.answer("⏳ Запуск...")
+    msg = await m.answer("◐ Запуск...")
     spinner = ProgressSpinner(msg)
     await spinner.start()
 
     try:
-        schedules = await fetch_data(
-            page_user,
-            lock_user,
-            force=True,
-            progress=spinner
-        )
-
+        schedules = await fetch_data(page_user, lock_user, force=True, progress=spinner)
         if not schedules:
             await spinner.stop()
-            await msg.edit_text("❌ Не удалось получить данные.")
+            await msg.edit_text("❌ Ошибка данных.")
             return
 
-        ans = calculate_time_left(schedules)
-
-        full_text = "💡<b>Актуальный График</b>💡\n"
-        full_text += "━━━━━━━━━━━━━━━━\n"
-
-        for rel in sorted(schedules.keys()):
+        # Собираем все графики в один блок <pre>
+        unified_schedule = ""
+        sorted_keys = sorted(schedules.keys())
+        for rel in sorted_keys:
             d = schedules[rel]
-            full_text += f"⚡<b>{d['dateText']}</b>⚡\n"
-            full_text += f"<code>{d['schedule']}</code>\n"
+            unified_schedule += f"⚡{d['dateText']} ⚡\n{d['schedule']}\n\n"
 
-        full_text += "━━━━━━━━━━━━━━━━\n"
-
-        raw_time = list(schedules.values())[0]['updateTime']
+        # Сохраняем текст уведомления для кнопки
+        global current_attention_text
+        current_attention_text = schedules[sorted_keys[0]].get('attention', "Нету информации.")
+        ans = calculate_time_left(schedules)
+        raw_time = schedules[sorted_keys[0]]['updateTime']
         clean_time = raw_time.split(": ")[-1] if ": " in raw_time else raw_time
 
+        full_text = f"💡<b>Актуальний Графік</b>💡\n"
+        full_text += f"<pre>{unified_schedule.strip()}</pre>\n"
         full_text += ans
-        full_text += f"🕒 <b>Обновлено:</b> <code>{clean_time}</code>\n"
+        full_text += f"<pre>🕒 <b>Обновлено:</b> {clean_time}</pre>"
+
+        # Создаем кнопку
+        builder = InlineKeyboardBuilder()
+        builder.row(types.InlineKeyboardButton(text="🔹 Информация на сегодня", callback_data="show_att"))
 
         await spinner.stop()
-        await msg.edit_text(full_text, parse_mode="HTML")
+        await msg.edit_text(full_text, reply_markup=builder.as_markup(), parse_mode="HTML")
 
     except Exception as e:
         await spinner.stop()
-        await msg.edit_text("❌ Ошибка при получении данных.")
         logging.error(e)
+        await msg.edit_text("❌ Произошла ошибка.")
+
+@dp.callback_query(F.data == "show_att")
+async def callback_att(call: types.CallbackQuery):
+    # Отправляем сообщение и сохраняем объект сообщения в переменную 'info_msg'
+    info_msg = await call.message.answer(
+        f"📢 <b>Повідомлення Укренерго:</b>\n\n{current_attention_text}", 
+        parse_mode="HTML"
+    )
+    await call.answer() # Убираем "часики" с кнопки
+
+    # Запускаем фоновую задачу удаления, чтобы не блокировать бота
+    asyncio.create_task(delete_message_after(info_msg, 120)) # 120 секунд (2 минуты)
+
 def get_kb(uid):
     return types.ReplyKeyboardMarkup(
         keyboard=[[types.KeyboardButton(text="⚡ Показать график")], [types.KeyboardButton(text="🔔 Мониторинг")]], 
@@ -436,7 +441,7 @@ def get_kb(uid):
 async def start_cmd(m: types.Message):
     await m.answer("Бот запущен.", reply_markup=get_kb(m.from_user.id))
 
-@dp.message(F.text.contains("мониторинг"))
+@dp.message(F.text.contains("мониторинг") | F.text.contains("Мониторинг") | F.text.contains("🔔"))
 async def toggle(m: types.Message):
     uid = str(m.from_user.id)
     if redis.sismember("monitoring_users", uid):
