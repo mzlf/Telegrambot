@@ -83,7 +83,7 @@ class ProgressSpinner:
     def __init__(self, message):
         self.message = message
         self.running = True
-        self.stage_text = "Запуск..."
+        self.stage_text = "Инициализация"
         self.task = None
         self.frame = 0
 
@@ -268,16 +268,16 @@ def calculate_time_left(schedules):
                 break
 
     # --- Сборка сообщения ---
-    status_text = "🔋 Включено" if current_state == "🟢" else "🪫 Отключено"
+    status_text = "🔋 Свет есть" if current_state == "🟢" else "🪫 Света отключен"
     
-    res = f"💡 <b>Текущий статус</b>\n"
+    res = f"💡 <b>ИНФОРМАЦИЯ ПО СЕТИ</b>\n"
     res += f" ↳ <b>Сейчас</b>: {status_text}\n"
     
     # Добавляем найденные события
     if events:
         res += "\n".join(events) + "\n"
     else:
-        res += " ↳ <b>✨ Отключений не планируется</b>\n"
+        res += " ↳ ✨<b>Отключений не планируется</b>\n"
 
     # --- Статистика ---
     today_off = raw_today.count("🔴") / 2
@@ -338,13 +338,13 @@ async def monitoring_task():
                 unified_schedule = ""
                 for rel in sorted(schedules.keys()):
                     d = schedules[rel]
-                    unified_schedule += f"⚡{d['dateText']} ⚡\n{d['schedule']}\n\n"
+                    unified_schedule += f"⚡{d['dateText']}⚡\n{d['schedule']}\n\n"
 
                 raw_time = schedules[first_day_rel]['updateTime']
                 clean_time = raw_time.split(": ")[-1] if ": " in raw_time else raw_time
                 
                 msg = (
-                    "🔔 <b>ГРАФИК ИЗМЕНИЛСЯ!!</b>\n"
+                    "🔔 <b>ГРАФИК ИЗМЕНИЛСЯ</b>\n"
                     f"<pre>{unified_schedule.strip()}</pre>\n"
                     f"{ans}\n"
                     f"<pre>🕒 Обновлено: {clean_time}</pre>"
@@ -379,7 +379,7 @@ async def manual(m: types.Message):
         schedules = await fetch_data(page_user, lock_user, force=True, progress=spinner)
         if not schedules:
             await spinner.stop()
-            await msg.edit_text("❌ Ошибка данных.")
+            await msg.edit_text("❌ <b>Ошибка:</b> Не удалось получить данные.")
             return
 
         # Собираем все графики в один блок <pre>
@@ -387,23 +387,23 @@ async def manual(m: types.Message):
         sorted_keys = sorted(schedules.keys())
         for rel in sorted_keys:
             d = schedules[rel]
-            unified_schedule += f"⚡{d['dateText']} ⚡\n{d['schedule']}\n\n"
+            unified_schedule += f"⚡{d['dateText']}⚡\n{d['schedule']}\n\n"
 
         # Сохраняем текст уведомления для кнопки
         global current_attention_text
-        current_attention_text = schedules[sorted_keys[0]].get('attention', "Нету информации.")
+        current_attention_text = schedules[sorted_keys[0]].get('attention', "Информация отсутствует.")
         ans = calculate_time_left(schedules)
         raw_time = schedules[sorted_keys[0]]['updateTime']
         clean_time = raw_time.split(": ")[-1] if ": " in raw_time else raw_time
 
-        full_text = f"💡<b>Актуальний Графік</b>💡\n"
+        full_text = f"💡<b>ГРАФИК ОТКЛЮЧЕНИЙ</b>\n"
         full_text += f"<pre>{unified_schedule.strip()}</pre>\n"
         full_text += ans
         full_text += f"<pre>🕒 <b>Обновлено:</b> {clean_time}</pre>"
 
         # Создаем кнопку
         builder = InlineKeyboardBuilder()
-        builder.row(types.InlineKeyboardButton(text="🔹 Информация на сегодня", callback_data="show_att"))
+        builder.row(types.InlineKeyboardButton(text="📢 Уведомление Укрэнерго", callback_data="show_att"))
 
         await spinner.stop()
         await msg.edit_text(full_text, reply_markup=builder.as_markup(), parse_mode="HTML")
@@ -411,13 +411,12 @@ async def manual(m: types.Message):
     except Exception as e:
         await spinner.stop()
         logging.error(e)
-        await msg.edit_text("❌ Произошла ошибка.")
-
+        await msg.edit_text("⚠️ <b>Произошла критическая ошибка при парсинге.</b>")
 @dp.callback_query(F.data == "show_att")
 async def callback_att(call: types.CallbackQuery):
     # Отправляем сообщение и сохраняем объект сообщения в переменную 'info_msg'
     info_msg = await call.message.answer(
-        f"📢 <b>Повідомлення Укренерго:</b>\n\n{current_attention_text}", 
+        f"📢 <b>Уведомление Укрэнерго:</b>\n\n{current_attention_text}", 
         parse_mode="HTML"
     )
     await call.answer() # Убираем "часики" с кнопки
