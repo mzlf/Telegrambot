@@ -277,7 +277,7 @@ def calculate_time_left(schedules):
     if events:
         res += "\n".join(events) + "\n"
     else:
-        res += " ↳ ✨ Отключений не планируется\n"
+        res += " ↳ <b>✨ Отключений не планируется</b>\n"
 
     # --- Статистика ---
     today_off = raw_today.count("🔴") / 2
