@@ -68,7 +68,36 @@ analysis_script = """
     return { dateId, dateText, schedule: intervals.join("\\n"), raw_statuses, updateTime };
 }
 """
+clock_frames = ["◐","◓","◑","◒"]
 
+class ProgressSpinner:
+    def __init__(self, message):
+        self.message = message
+        self.running = True
+        self.stage_text = "Запуск..."
+        self.task = None
+        self.frame = 0
+
+    async def start(self):
+        self.task = asyncio.create_task(self._spin())
+
+    async def _spin(self):
+        while self.running:
+            text = f"{clock_frames[self.frame % len(clock_frames)]} {self.stage_text}"
+            try:
+                await self.message.edit_text(text)
+            except:
+                pass
+            self.frame += 1
+            await asyncio.sleep(0.5)
+
+    async def update(self, new_stage):
+        self.stage_text = new_stage
+
+    async def stop(self):
+        self.running = False
+        if self.task:
+            self.task.cancel()
 # =============================
 # 🌐 Логика браузера
 # =============================
@@ -129,105 +158,157 @@ async def reload_page(p):
 # =============================
 # 📊 Универсальный парсер
 # =============================
-async def fetch_data(p, lock, force=False):
+async def fetch_data(p, lock, force=False, progress=None):
     async with lock:
+
+        if progress:
+            await progress.update("🌍 Открываю сайт...")
+
         if force:
             await reload_page(p)
-        
-        try:
-            result = {}
-            tabs = p.locator("#discon-fact .dates .date")
-            count = await tabs.count()
-            if count == 0: 
-                await reload_page(p)
-                return await fetch_data(p, lock, force=False)
 
-            for i in range(count):
-                tab = tabs.nth(i)
-                await tab.click(timeout=5000)
-                data = await p.evaluate(analysis_script)
-                if data and data.get("dateId"):
-                    result[data["dateId"]] = data
-            return result
-        except:
-            return {}
-        
+        if progress:
+            await progress.update("📅 Получаю вкладки...")
+
+        tabs = p.locator("#discon-fact .dates .date")
+        count = await tabs.count()
+
+        if count == 0:
+            if progress:
+                await progress.update("🔄 Перезагрузка...")
+            await reload_page(p)
+            return await fetch_data(p, lock, False, progress)
+
+        result = {}
+
+        for i in range(count):
+            if progress:
+                await progress.update(f"📊 Обрабатываю день {i+1}/{count}...")
+
+            tab = tabs.nth(i)
+            await tab.click(timeout=5000)
+            data = await p.evaluate(analysis_script)
+
+            if data and data.get("dateId"):
+                result[data["dateId"]] = data
+
+        if progress:
+            await progress.update("🧠 Анализирую данные...")
+
+        return result        
 def h_str(h):
         return str(int(h)) if h % 1 == 0 else str(h)
 
 # =============================
-# ⏳ Расчет времени (Остается без изменений)
+# ⏳ Расчет времени
 # =============================
+def format_time(h, m):
+    if h == 0 and m == 0:
+        return "меньше минуты"
+    if h == 0:
+        return f"{m} мин"
+    if m == 0:
+        return f"{h}ч"
+    return f"{h}ч {m} мин"
+
 def calculate_time_left(schedules):
     if not schedules:
         return "Нет данных для расчета."
 
     tz = pytz.timezone('Europe/Kiev')
     now = datetime.now(tz)
-    
+
     sorted_rels = sorted(schedules.keys())
     today_rel = sorted_rels[0]
-    
+
     raw_today = schedules[today_rel].get('raw_statuses', [])
     if not raw_today:
         return "График на сегодня пуст."
-    off_intervals = raw_today.count("🔴")
-    on_intervals = raw_today.count("🟢")
-    
-    # Переводим в часы (каждый интервал = 0.5 часа)
-    hours_off = off_intervals / 2
-    hours_on = on_intervals / 2
-    
-    # Красивое форматирование: убираем .0 если число целое
 
-    # Берем завтрашний день для переходов через полночь
+    # Завтра (если есть)
     raw_tomorrow = []
     if len(sorted_rels) > 1:
         raw_tomorrow = schedules[sorted_rels[1]].get('raw_statuses', [])
 
+    # Полная линия времени (сегодня + завтра)
     full_timeline = raw_today + raw_tomorrow
-    
+
     minutes_now = now.hour * 60 + now.minute
     current_idx = minutes_now // 30
-    
+
     if current_idx >= len(raw_today):
         return "Сегодняшний график уже не актуален."
 
     current_state = full_timeline[current_idx]
-    
-    # --- 1. Ищем ПЕРВОЕ изменение (ближайшее) ---
-    first_change_idx = -1
+
+    # ==============================
+    # 🔎 Поиск первого изменения
+    # ==============================
+    first_change_idx = None
     for i in range(current_idx + 1, len(full_timeline)):
         if full_timeline[i] != current_state:
             first_change_idx = i
             break
-            
-    if first_change_idx == -1:
-        return f"<blockquote>✨Сегодня без отключений✨</blockquote>\n"
 
-    # Расчет времени до 1-го события
+    # Если изменений нет вообще
+    if first_change_idx is None:
+        today_off = raw_today.count("🔴") / 2
+        today_on = raw_today.count("🟢") / 2
+
+        res = "<blockquote>✨Сегодня без отключений✨</blockquote>\n"
+        res += f"📊 <b>За сегодня:</b> 🟢 {h_str(today_on)}ч | 🔴 {h_str(today_off)}ч\n"
+
+        if raw_tomorrow:
+            tomorrow_off = raw_tomorrow.count("🔴") / 2
+            tomorrow_on = raw_tomorrow.count("🟢") / 2
+            res += f"📅 <b>За завтра:</b> 🟢 {h_str(tomorrow_on)}ч | 🔴 {h_str(tomorrow_off)}ч\n"
+
+        return res
+
+    # ==============================
+    # ⏳ Первое событие
+    # ==============================
     diff1 = (first_change_idx * 30) - minutes_now
     h1, m1 = diff1 // 60, diff1 % 60
-    action1 = "<b>Включение через:</b>" if current_state == "🔴" else "<b>Выключение через:</b>"
-    
-    res = f"<blockquote>💡<b>Статус:</b>{current_state}</blockquote>\n<b><i>⏳</i>{action1}</b> <b>{h1}</b><b>ч</b> <b>{m1}</b> <b>минут</b>\n"
-    # --- 2. Ищем ВТОРОЕ изменение (следующее за первым) ---
-    second_change_idx = -1
+
+    action1 = "🟢 Включение через:" if current_state == "🔴" else "🔴Выключение через:"
+
+    res = (
+        f"<blockquote>💡<b>Статус:</b> {current_state}</blockquote>\n"
+        f"<b>{action1}</b> {format_time(h1, m1)}\n"    
+        )
+
+    # ==============================
+    # 🔎 Второе изменение
+    # ==============================
+    second_change_idx = None
     next_state = full_timeline[first_change_idx]
+
     for i in range(first_change_idx + 1, len(full_timeline)):
         if full_timeline[i] != next_state:
             second_change_idx = i
             break
-    
-    if second_change_idx != -1:
-        # Расчет времени от ТЕКУЩЕГО момента до 2-го события
+
+    if second_change_idx is not None:
         diff2 = (second_change_idx * 30) - minutes_now
         h2, m2 = diff2 // 60, diff2 % 60
-        action2 = "<b>Включение через:</b>" if next_state == "🔴" else "<b>Выключение через:</b>"
-        
-        # Добавляем инфо про второе событие
-        res += f"<b>⏳{action2}</b> <b>{h2}</b><b>ч</b> <b>{m2}</b> <b>минут</b>\n"
-        res += f"📊 <b>За сегодня: 🟢 {h_str(hours_on)}ч | 🔴 {h_str(hours_off)}ч</b>\n"
+
+        action2 = "🟢 Включение через:" if next_state == "🔴" else "🔴Выключение через:"
+
+        res +=  f"<b>{action2}</b> {format_time(h2, m2)}\n"
+
+    # ==============================
+    # 📊 Статистика
+    # ==============================
+    today_off = raw_today.count("🔴") / 2
+    today_on = raw_today.count("🟢") / 2
+
+    res += f"📊 <b>За сегодня:</b> 🟢 {h_str(today_on)}ч | 🔴 {h_str(today_off)}ч\n"
+
+    if raw_tomorrow:
+        tomorrow_off = raw_tomorrow.count("🔴") / 2
+        tomorrow_on = raw_tomorrow.count("🟢") / 2
+        res += f"📅 <b>За завтра:</b> 🟢 {h_str(tomorrow_on)}ч | 🔴 {h_str(tomorrow_off)}ч\n"
 
     return res
 # =============================
@@ -274,14 +355,14 @@ async def monitoring_task():
                     
                     # Шапка уведомления
                     msg = "🔔 <b>ГРАФИК ИЗМЕНИЛСЯ!!</b>\n"
-                    msg += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
+                    msg += "━━━━━━━━━━━━━━━━\n"
 
                     # Графики (делаем моноширинными через <code>)
                     for r in sorted(schedules.keys()):
                         msg += f"⚡<b>{schedules[r]['dateText']}</b>⚡\n"
                         msg += f"<code>{schedules[r]['schedule']}</code>\n"
                     
-                    msg += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
+                    msg += "━━━━━━━━━━━━━━━━\n"
                     
                     # Техническая инфа (время обновления)
                     raw_time = list(schedules.values())[0]['updateTime']
@@ -302,36 +383,49 @@ async def monitoring_task():
 # =============================
 @dp.message(F.text.contains("график") | F.text.contains("Показать"))
 async def manual(m: types.Message):
-    msg = await m.answer("🔍 Проверяю сайт (полное обновление)...")
-    # Для юзера ВСЕГДА force=True
-    schedules = await fetch_data(page_user, lock_user, force=True)
-    
-    if not schedules:
-        await msg.edit_text("❌ Не удалось получить данные.")
-        return
 
-    ans = calculate_time_left(schedules)   
-    
-    # Заголовок
-    full_text = "💡<b>Актуальный График</b>💡\n"
-    full_text += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
-    
-    # Графики
-    for rel in sorted(schedules.keys()):
-        d = schedules[rel]
-        full_text += f"⚡<b>{d['dateText']}</b>⚡\n"
-        full_text += f"<code>{d['schedule']}</code>\n"
+    msg = await m.answer("⏳ Запуск...")
+    spinner = ProgressSpinner(msg)
+    await spinner.start()
 
-    full_text += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
-    
-    # Время обновления
-    raw_time = list(schedules.values())[0]['updateTime']
-    clean_time = raw_time.split(": ")[-1] if ": " in raw_time else raw_time
-    
-    full_text += ans
-    full_text += f"🕒 <b>Обновлено:</b> <code>{clean_time}</code>\n"
-    
-    await msg.edit_text(full_text, parse_mode="HTML")
+    try:
+        schedules = await fetch_data(
+            page_user,
+            lock_user,
+            force=True,
+            progress=spinner
+        )
+
+        if not schedules:
+            await spinner.stop()
+            await msg.edit_text("❌ Не удалось получить данные.")
+            return
+
+        ans = calculate_time_left(schedules)
+
+        full_text = "💡<b>Актуальный График</b>💡\n"
+        full_text += "━━━━━━━━━━━━━━━━\n"
+
+        for rel in sorted(schedules.keys()):
+            d = schedules[rel]
+            full_text += f"⚡<b>{d['dateText']}</b>⚡\n"
+            full_text += f"<code>{d['schedule']}</code>\n"
+
+        full_text += "━━━━━━━━━━━━━━━━\n"
+
+        raw_time = list(schedules.values())[0]['updateTime']
+        clean_time = raw_time.split(": ")[-1] if ": " in raw_time else raw_time
+
+        full_text += ans
+        full_text += f"🕒 <b>Обновлено:</b> <code>{clean_time}</code>\n"
+
+        await spinner.stop()
+        await msg.edit_text(full_text, parse_mode="HTML")
+
+    except Exception as e:
+        await spinner.stop()
+        await msg.edit_text("❌ Ошибка при получении данных.")
+        logging.error(e)
 def get_kb(uid):
     return types.ReplyKeyboardMarkup(
         keyboard=[[types.KeyboardButton(text="⚡ Показать график")], [types.KeyboardButton(text="🔔 Мониторинг")]], 
