@@ -433,7 +433,7 @@ def get_kb():
 
 @dp.message(Command("start"))
 async def start_cmd(m: types.Message):
-    await m.answer("Бот запущен.", reply_markup=get_kb(m.from_user.id))
+    await m.answer("Бот запущен.", reply_markup=get_kb())
 
 @dp.message(F.text.contains("мониторинг") | F.text.contains("Мониторинг") | F.text.contains("🔔"))
 async def toggle(m: types.Message):
