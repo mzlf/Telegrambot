@@ -179,20 +179,17 @@ async def fetch_data(p, lock, force=False, progress=None):
 
         if progress:
             await progress.update("Открываю сайт...")
-            await asyncio.sleep(.5) # Чтобы было видно стадию
         if force:
             await reload_page(p)
 
         if progress:
             await progress.update("Получаю вкладки...")
-            await asyncio.sleep(.5)
         tabs = p.locator("#discon-fact .dates .date")
         count = await tabs.count()
 
         if count == 0:
             if progress:
                 await progress.update("Перезагрузка...")
-                await asyncio.sleep(.5)
             await reload_page(p)
             return await fetch_data(p, lock, False, progress)
 
@@ -201,7 +198,6 @@ async def fetch_data(p, lock, force=False, progress=None):
         for i in range(count):
             if progress:
                 await progress.update(f"Обрабатываю день {i+1}/{count}...")
-                await asyncio.sleep(.5)
             tab = tabs.nth(i)
             await tab.click(timeout=5000)
             data = await p.evaluate(analysis_script)
@@ -211,15 +207,13 @@ async def fetch_data(p, lock, force=False, progress=None):
 
         if progress:
             await progress.update("Анализирую данные...")
-            await asyncio.sleep(.5)
-
         return result        
-def h_str(h):
-    return str(int(h)) if h % 1 == 0 else str(h)
 
 # =============================
 # ⏳ Расчет времени
 # =============================
+def h_str(h):
+    return str(int(h)) if h % 1 == 0 else str(h)
 def format_time(h, m):
     if h == 0 and m == 0:
         return "меньше минуты"
@@ -431,7 +425,7 @@ async def callback_att(call: types.CallbackQuery):
     # Запускаем фоновую задачу удаления, чтобы не блокировать бота
     asyncio.create_task(delete_message_after(info_msg, 120)) # 120 секунд (2 минуты)
 
-def get_kb(uid):
+def get_kb():
     return types.ReplyKeyboardMarkup(
         keyboard=[[types.KeyboardButton(text="⚡ Показать график")], [types.KeyboardButton(text="🔔 Мониторинг")]], 
         resize_keyboard=True
