@@ -346,7 +346,7 @@ async def monitoring_task():
                 msg = (
                     "🔔 <b>ГРАФИК ИЗМЕНИЛСЯ</b>\n"
                     f"<pre>{unified_schedule.strip()}</pre>\n"
-                    f"{ans}\n"
+                    f"{ans}"
                     f"<pre>🕒 Обновлено: {clean_time}</pre>"
                 )
 
