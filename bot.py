@@ -166,7 +166,7 @@ async def start_browser():
     playwright = await async_playwright().start()
     # ДОБАВЛЕНЫ КРИТИЧЕСКИЕ ФЛАГИ ДЛЯ EKONOMИИ ПАМЯТИ В LINUX/DOCKER
     browser = await playwright.chromium.launch(
-        headless=HEADLESS,
+        headless=True,
         args=[
             "--no-sandbox",
             "--disable-setuid-sandbox",
