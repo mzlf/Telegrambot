@@ -1,5 +1,5 @@
 """
-DTEK Kyiv-region outage bot - GROUP-ONLY, speed-optimised.
+DTEK Kyiv-region outage bot - Optimized, Anti-Bot & Low RAM usage.
 """
 import asyncio
 import html
@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timedelta
 
 import pytz
-import redis  # Используем стандартный redis-py
+import redis
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -20,25 +20,22 @@ from playwright.async_api import async_playwright
 # ============================= CONFIG =============================
 TOKEN = "8699245998:AAFrajfnUyi7lVNdPvzrykAz6KjWcgAtXHw"
 
-# Подключение к Redis по твоему хосту и порту
 REDIS_HOST = "wrench-microstrong-back-61275.db.redis.io"
 REDIS_PORT = 17778
 REDIS_PASSWORD = "ZZjNkOsY6RK6iojvs721XY8sYB8c4fHM"
 
-GROUP = "GPV4.1"                    # <- your queue/group
+GROUP = "GPV4.1"
 SITE_URL = "https://www.dtek-krem.com.ua/ua/shutdowns"
 SITE_HOST = "dtek-krem.com.ua"
-HEADLESS = os.getenv("HEADLESS", "0") == "1"
-CHECK_INTERVAL = 300                  # monitoring period, seconds
-CACHE_TTL = 30                        # manual requests reuse data younger than this
-FAST_RETRY_AFTER = 3600               # after a fast-mode failure, wait this long before trying it again
+HEADLESS = os.getenv("HEADLESS", "1") == "1"
+CHECK_INTERVAL = 300
+CACHE_TTL = 60                        # Увеличили TTL кэша до 60 сек, чтобы снизить нагрузку
 DEFAULT_ATTENTION = "Актуальних повідомлень немає."
 TZ = pytz.timezone("Europe/Kiev")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Инициализация клиента Redis
 redis_client = redis.Redis(
     host=REDIS_HOST,
     port=REDIS_PORT,
@@ -49,15 +46,11 @@ redis_client = redis.Redis(
 
 logging.basicConfig(level=logging.INFO)
 
-# browser state
+# browser state (держим инстанс запущенным для мгновенных ответов)
 playwright = None
 browser = None
-page = None
+context = None
 fetch_lock = asyncio.Lock()
-_block_assets = True                  # read by the route handler
-_fast_disabled_until = 0.0
-
-# last successfully parsed snapshot
 _cache = {"ts": 0.0, "snap": None}
 
 
@@ -66,18 +59,15 @@ def now_kyiv():
 
 
 def _s(x):
-    """Redis may return bytes or str depending on client settings."""
     return x.decode() if isinstance(x, bytes) else x
 
 
 async def rcall(fn, *args, **kwargs):
-    """Run a blocking Redis call in a thread so it never stalls the bot."""
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 # ============================= PARSING =============================
 def extract_fact_from_html(page_html: str):
-    """Pull `DisconSchedule.fact = {...}` out of raw HTML."""
     m = re.search(r"DisconSchedule\.fact\s*=\s*", page_html)
     if not m:
         return None
@@ -89,18 +79,16 @@ def extract_fact_from_html(page_html: str):
 
 
 def extract_attention_from_html(page_html: str) -> str:
-    """Text of the 'Шановні клієнти!' notice (.m-attention__text), if the site shows one."""
     m = re.search(r'class="[^"]*m-attention__text[^"]*"[^>]*>(.*?)</div>', page_html, re.S)
     if not m:
         return DEFAULT_ATTENTION
     text = html.unescape(re.sub(r"<[^>]+>", "", m.group(1)))
     text = re.sub(r"\s+", " ", text).strip()
-    text = re.sub(r"\s+([.,!?;:])", r"\1", text)   # "мережі ." -> "мережі."
+    text = re.sub(r"\s+([.,!?;:])", r"\1", text)
     return text or DEFAULT_ATTENTION
 
 
 def day_to_slots(day: dict) -> list:
-    """24 hourly values -> 48 half-hour slots of 🟢 / 🔴."""
     slots = []
     for h in range(1, 25):
         v = day.get(str(h), "yes")
@@ -110,7 +98,6 @@ def day_to_slots(day: dict) -> list:
 
 
 def slots_to_text(slots: list) -> str:
-    """Only the OUTAGE intervals - power-on periods are not listed."""
     def fmt(i):
         m = i * 30
         return f"{m // 60:02d}:{m % 60:02d}"
@@ -147,86 +134,69 @@ def day_title(d, now) -> str:
     return f"{label} {d.strftime('%d.%m.%Y')}"
 
 
-# ============================= BROWSER =============================
-# ============================= BROWSER =============================
-async def _route_handler(route):
-    try:
-        req = route.request
-        is_site_doc = req.resource_type == "document" and SITE_HOST in req.url
-        if _block_assets and not is_site_doc:
-            await route.abort()
-        else:
-            await route.continue_()
-    except Exception:
-        pass
-
-
+# ============================= BROWSER (STEALTH & LOW-RAM) =============================
 async def start_browser():
-    global playwright, browser, page
+    global playwright, browser, context
+    if browser:
+        return
     playwright = await async_playwright().start()
-    # ДОБАВЛЕНЫ КРИТИЧЕСКИЕ ФЛАГИ ДЛЯ EKONOMИИ ПАМЯТИ В LINUX/DOCKER
     browser = await playwright.chromium.launch(
-        headless=True,
+        headless=HEADLESS,
         args=[
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--no-zygote",
-            "--single-process" # помогает экономить RAM на слабых серверах
+            "--disable-blink-features=AutomationControlled",  # Убирает метку бота
         ]
     )
-    context = await browser.new_context(user_agent="Mozilla/5.0")
-    await context.route("**/*", _route_handler)
-    page = await context.new_page()
+    # Создаем контекст с реальными параметрами живого пользователя (анти-бот)
+    context = await browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        viewport={"width": 1920, "height": 1080},
+        device_scale_factor=1,
+    )
 
 
 async def stop_browser():
-    global playwright, browser, page
+    global playwright, browser, context
     try:
+        if context:
+            await context.close()
         if browser:
             await browser.close()
         if playwright:
             await playwright.stop()
     except Exception:
         pass
-    playwright = browser = page = None
+    playwright = browser = context = None
 
 
 async def fetch_fact():
-    last_err = RuntimeError("DisconSchedule.fact not found on the page")
-
+    """Загружает страницу с обходом защит и парсит данные."""
+    await start_browser()
+    page = await context.new_page()
     try:
-        if page is None:
-            await start_browser()
+        # Убираем признаки автоматизации (navigator.webdriver = false)
+        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
-        # Сразу делаем полноценную загрузку (без блокировки ассетов)
-        text = await _load_html(fast=False)
+        await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=25000)
+        
+        # Ждем появления объекта расписания от скриптов сайта
+        await page.wait_for_function(
+            "() => typeof DisconSchedule !== 'undefined' && !!DisconSchedule.fact",
+            timeout=12000,
+        )
+        text = await page.content()
         fact = extract_fact_from_html(text)
         
         if fact and "data" in fact:
             return fact, extract_attention_from_html(text)
             
-        logging.warning("DisconSchedule.fact not in response")
-    except Exception as e:
-        last_err = e
-        logging.error("Fetch failed: %s", e)
-        await stop_browser()   # перезапуск браузера при ошибке
-        
-    raise last_err
-
-async def _load_html() -> str:
-    """Полная загрузка страницы с ожиданием появления данных графиков."""
-    await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=30000)
-    try:
-        await page.wait_for_function(
-            "() => typeof DisconSchedule !== 'undefined' && !!DisconSchedule.fact",
-            timeout=15000,
-        )
-    except Exception as e:
-        logging.warning("Full load: DisconSchedule.fact did not appear (%s)", e)
-    return await page.content()
-
+        raise RuntimeError("DisconSchedule.fact not found in page content")
+    finally:
+        await page.close()  # Закрываем вкладку, чтобы не текла память
 
 
 def _cache_fresh() -> bool:
@@ -385,6 +355,7 @@ async def manual(m: types.Message):
     builder.row(types.InlineKeyboardButton(
         text="📢 Уведомление Укрэнерго", callback_data="show_att"))
 
+    # Если кеш свежий — отдает МГНОВЕННО без единого обращения к браузеру!
     if _cache_fresh():
         await m.answer(render_message(_cache["snap"], "💡<b>ГРАФИК ОТКЛЮЧЕНИЙ</b>"),
                        reply_markup=builder.as_markup(), parse_mode="HTML")
