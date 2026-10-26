@@ -1,219 +1,257 @@
+"""
+DTEK Kyiv-region outage bot - GROUP-ONLY, speed-optimised.
+"""
 import asyncio
-import logging
+import html
 import json
+import logging
+import os
+import re
+import time
 from datetime import datetime, timedelta
+
 import pytz
-from aiogram import Bot, Dispatcher, types, F
+import redis  # Используем стандартный redis-py
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from upstash_redis import Redis
 from playwright.async_api import async_playwright
 
-# --- КОНФИГ ---
-TOKEN = "8702758834:AAHbQNtVyNl85z2xtPiuHlAbUfPSBqtCshA"
-REDIS_URL = "https://driven-fox-52037.upstash.io"
-REDIS_TOKEN = "ActFAAIncDI4YzQwMjBhNzkxNzY0YmYzYjFhN2FmZGJkODg0NmFiMHAyNTIwMzc"
+# ============================= CONFIG =============================
+TOKEN = "8699245998:AAFrajfnUyi7lVNdPvzrykAz6KjWcgAtXHw"
 
-CITY, STREET, HOUSE = "с. Мала Михайлівка", "вул. Бесарабська", "32/"
+# Подключение к Redis по твоему хосту и порту
+REDIS_HOST = "wrench-microstrong-back-61275.db.redis.io"
+REDIS_PORT = 17778
+REDIS_PASSWORD = "ZZjNkOsY6RK6iojvs721XY8sYB8c4fHM"
+
+GROUP = "GPV4.1"                    # <- your queue/group
+SITE_URL = "https://www.dtek-krem.com.ua/ua/shutdowns"
+SITE_HOST = "dtek-krem.com.ua"
+HEADLESS = os.getenv("HEADLESS", "0") == "1"
+CHECK_INTERVAL = 300                  # monitoring period, seconds
+CACHE_TTL = 30                        # manual requests reuse data younger than this
+FAST_RETRY_AFTER = 3600               # after a fast-mode failure, wait this long before trying it again
+DEFAULT_ATTENTION = "Актуальних повідомлень немає."
+TZ = pytz.timezone("Europe/Kiev")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
-redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
+
+# Инициализация клиента Redis
+redis_client = redis.Redis(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    decode_responses=True,
+    username="default",
+    password=REDIS_PASSWORD,
+)
 
 logging.basicConfig(level=logging.INFO)
 
-# Переменные браузера
+# browser state
 playwright = None
 browser = None
-page_monitor = None
-page_user = None
-current_attention_text = "Актуальних повідомлень немає."
-lock_monitor = asyncio.Lock()
-lock_user = asyncio.Lock()
+page = None
+fetch_lock = asyncio.Lock()
+_block_assets = True                  # read by the route handler
+_fast_disabled_until = 0.0
 
-# ТРЕКЕР ОБНОВЛЕНИЯ ДЛЯ МОНИТОРИНГА
-last_monitor_reload = None
+# last successfully parsed snapshot
+_cache = {"ts": 0.0, "snap": None}
 
-# =============================
-# 🔥 JS анализ графика
-# =============================
-analysis_script = """
-() => {
-    const activeTab = document.querySelector("#discon-fact .dates .date.active");
-    const dateId = activeTab ? activeTab.getAttribute("rel") : null;
-    const dateTextElem = activeTab ? activeTab.querySelector("div:nth-child(2)") : null;
-    const dateText = dateTextElem ? dateTextElem.innerText.trim() : "Графік";
-    
-    // ПАРСИНГ СИНЕГО БЛОКА ВНИМАНИЯ
-    const attentionElem = document.querySelector(".m-attention__text");
-    const attentionText = attentionElem ? attentionElem.innerText.trim() : "Актуальних повідомлень від Укренерго немає.";
 
-    const updateTimeElem = document.querySelector("#discon-fact .discon-fact-info-text");
-    const updateTime = updateTimeElem ? updateTimeElem.innerText.trim() : "---";
-    
-    const row = document.querySelector("#discon-fact .discon-fact-table.active table tbody tr");
-    if (!row) return { dateId, dateText, schedule: "Графік не знайдено", raw_statuses: [], updateTime, attention: attentionText };
-    
-    const cells = Array.from(row.querySelectorAll("td")).slice(1, 25);
-    let raw_statuses = [];
-    cells.forEach(c => {
-        let s1 = (c.classList.contains('cell-scheduled') || c.classList.contains('cell-first-half')) ? "🔴" : "🟢";
-        let s2 = (c.classList.contains('cell-scheduled') || c.classList.contains('cell-second-half')) ? "🔴" : "🟢";
-        raw_statuses.push(s1, s2);
-    });
+def now_kyiv():
+    return datetime.now(TZ)
 
-    let intervals = [];
-    const fmt = (idx) => {
-        let m = idx * 30;
-        return String(Math.floor(m/60)).padStart(2,'0') + ":" + String(m%60).padStart(2,'0');
-    };
-    let cur = raw_statuses[0], start = 0;
-    for (let i = 1; i <= 48; i++) {
-        if (i === 48 || raw_statuses[i] !== cur) {
-            intervals.push(cur + fmt(start) + " — " + (i === 48 ? "00:00" : fmt(i)) + cur);
-            if(i < 48) { cur = raw_statuses[i]; start = i; }
-        }
-    }
-    return { dateId, dateText, schedule: intervals.join("\\n"), raw_statuses, updateTime, attention: attentionText };
-}
-"""
-clock_frames = ["◐","◓","◑","◒"]
 
-class ProgressSpinner:
-    def __init__(self, message):
-        self.message = message
-        self.running = True
-        self.stage_text = "Инициализация"
-        self.task = None
-        self.frame = 0
+def _s(x):
+    """Redis may return bytes or str depending on client settings."""
+    return x.decode() if isinstance(x, bytes) else x
 
-    async def start(self):
-        self.task = asyncio.create_task(self._spin())
 
-    async def _spin(self):
-        while self.running:
-            text = f"{clock_frames[self.frame % len(clock_frames)]} {self.stage_text} "
-            try:
-                await self.message.edit_text(text)
-            except:
-                pass
-            self.frame += 1
-            await asyncio.sleep(0.5)
+async def rcall(fn, *args, **kwargs):
+    """Run a blocking Redis call in a thread so it never stalls the bot."""
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
-    async def update(self, new_stage):
-        self.stage_text = new_stage
 
-    async def stop(self):
-        self.running = False
-        if self.task:
-            self.task.cancel()
-
-async def delete_message_after(message: types.Message, sleep_time: int):
-    await asyncio.sleep(sleep_time)
+# ============================= PARSING =============================
+def extract_fact_from_html(page_html: str):
+    """Pull `DisconSchedule.fact = {...}` out of raw HTML."""
+    m = re.search(r"DisconSchedule\.fact\s*=\s*", page_html)
+    if not m:
+        return None
     try:
-        await message.delete()
+        obj, _ = json.JSONDecoder().raw_decode(page_html[m.end():])
+        return obj
+    except ValueError:
+        return None
+
+
+def extract_attention_from_html(page_html: str) -> str:
+    """Text of the 'Шановні клієнти!' notice (.m-attention__text), if the site shows one."""
+    m = re.search(r'class="[^"]*m-attention__text[^"]*"[^>]*>(.*?)</div>', page_html, re.S)
+    if not m:
+        return DEFAULT_ATTENTION
+    text = html.unescape(re.sub(r"<[^>]+>", "", m.group(1)))
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+([.,!?;:])", r"\1", text)   # "мережі ." -> "мережі."
+    return text or DEFAULT_ATTENTION
+
+
+def day_to_slots(day: dict) -> list:
+    """24 hourly values -> 48 half-hour slots of 🟢 / 🔴."""
+    slots = []
+    for h in range(1, 25):
+        v = day.get(str(h), "yes")
+        slots.append("🔴" if v in ("no", "first") else "🟢")
+        slots.append("🔴" if v in ("no", "second") else "🟢")
+    return slots
+
+
+def slots_to_text(slots: list) -> str:
+    """Only the OUTAGE intervals - power-on periods are not listed."""
+    def fmt(i):
+        m = i * 30
+        return f"{m // 60:02d}:{m % 60:02d}"
+
+    lines, start = [], 0
+    for i in range(1, 49):
+        if i == 48 or slots[i] != slots[start]:
+            if slots[start] == "🔴":
+                end = "00:00" if i == 48 else fmt(i)
+                lines.append(f"🔴{fmt(start)} — {end}🔴")
+            start = i
+    return "\n".join(lines) or "🟢 Отключений нет"
+
+
+def parse_schedules(fact: dict) -> dict:
+    result = {}
+    for ts, groups in (fact.get("data") or {}).items():
+        day = groups.get(GROUP)
+        if not day:
+            continue
+        slots = day_to_slots(day)
+        result[int(ts)] = {
+            "date": datetime.fromtimestamp(int(ts), TZ).date(),
+            "slots": slots,
+            "text": slots_to_text(slots),
+            "sig": "".join(slots),
+        }
+    return dict(sorted(result.items()))
+
+
+def day_title(d, now) -> str:
+    delta = (d - now.date()).days
+    label = {0: "на сегодня", 1: "на завтра"}.get(delta, "на")
+    return f"{label} {d.strftime('%d.%m.%Y')}"
+
+
+# ============================= BROWSER =============================
+async def _route_handler(route):
+    try:
+        req = route.request
+        is_site_doc = req.resource_type == "document" and SITE_HOST in req.url
+        if _block_assets and not is_site_doc:
+            await route.abort()
+        else:
+            await route.continue_()
     except Exception:
         pass
-# =============================
-# 🌐 Логика браузера
-# =============================
-async def setup_page(ctx):
-    p = await ctx.new_page()
 
-    # Блокируем ВСЁ кроме document + xhr + fetch
-    await p.route("**/*", lambda route: route.abort()
-        if route.request.resource_type in ["image", "media", "font", "stylesheet", "other"] 
-        else route.continue_()
-    )
-
-    # Убираем анимации (ускоряет автокомплит)
-    await p.add_init_script("""
-        const style = document.createElement('style');
-        style.innerHTML = `* { transition: none !important; animation: none !important; }`;
-        document.head.appendChild(style);
-    """)
-
-    return p
 
 async def start_browser():
-    global playwright, browser, page_monitor, page_user
+    global playwright, browser, page
     playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch(headless=True,args=["--no-sandbox","--disable-dev-shm-usage","--disable-blink-features=AutomationControlled"])
-
+    browser = await playwright.chromium.launch(headless=True)
     context = await browser.new_context(user_agent="Mozilla/5.0")
-    
-    page_monitor = await setup_page(context)
-    page_user = await setup_page(context)
-    
-    # Первичная загрузка
-    await reload_page(page_monitor)
-    await reload_page(page_user)
+    await context.route("**/*", _route_handler)
+    page = await context.new_page()
 
-async def reload_page(p):
-    logging.info(f"⚡ Перезагрузка и ввод адреса на странице...")
+
+async def stop_browser():
+    global playwright, browser, page
     try:
-        await p.goto("https://www.dtek-krem.com.ua/ua/shutdowns", wait_until="domcontentloaded", timeout=30000)
-        try: await p.click("button.modal__close", timeout=500)
-        except: pass
+        if browser:
+            await browser.close()
+        if playwright:
+            await playwright.stop()
+    except Exception:
+        pass
+    playwright = browser = page = None
 
-        for sel, val, lid in [("input[name='city']", CITY, "city"), ("input[name='street']", STREET, "street"), ("input#house_num", HOUSE, "house_num")]:
-            field = p.locator(sel).first
-            await field.wait_for(state="attached", timeout=5000)
-            await field.fill(val)
-            try:
-                item = p.locator(f"#{lid}autocomplete-list div").first
-                await item.wait_for(state="attached", timeout=2000)
-                await item.click()
-            except:
-                await p.keyboard.press("ArrowDown")
-                await p.keyboard.press("Enter")
-        await p.wait_for_selector("#discon-fact", timeout=10000)
+
+async def _load_html(fast: bool) -> str:
+    global _block_assets
+    _block_assets = fast
+    if fast:
+        resp = await page.goto(SITE_URL, wait_until="commit", timeout=20000)
+        return await resp.text() if resp else await page.content()
+
+    await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=30000)
+    try:
+        await page.wait_for_function(
+            "() => typeof DisconSchedule !== 'undefined' && !!DisconSchedule.fact",
+            timeout=15000,
+        )
     except Exception as e:
-        logging.error(f"❌ Ошибка перезагрузки: {e}")
+        logging.warning("Full load: DisconSchedule.fact did not appear (%s)", e)
+    return await page.content()
 
-# =============================
-# 📊 Универсальный парсер
-# =============================
-async def fetch_data(p, lock, force=False, progress=None):
-    async with lock:
 
-        if progress:
-            await progress.update("Открываю сайт...")
-        if force:
-            await reload_page(p)
+async def fetch_fact():
+    global _fast_disabled_until
+    modes = (True, False) if time.monotonic() >= _fast_disabled_until else (False,)
+    last_err = RuntimeError("DisconSchedule.fact not found on the page")
 
-        if progress:
-            await progress.update("Получаю вкладки...")
-        tabs = p.locator("#discon-fact .dates .date")
-        count = await tabs.count()
+    for fast in modes:
+        try:
+            if page is None:
+                await start_browser()
+            text = await _load_html(fast)
+            fact = extract_fact_from_html(text)
+            if fact and "data" in fact:
+                if not fast and len(modes) == 2:
+                    _fast_disabled_until = time.monotonic() + FAST_RETRY_AFTER
+                    logging.warning("Fast mode failed but full load worked - using full load for a while")
+                return fact, extract_attention_from_html(text)
+            logging.warning("DisconSchedule.fact not in response (fast=%s)", fast)
+        except Exception as e:
+            last_err = e
+            logging.error("Fetch failed (fast=%s): %s", fast, e)
+            await stop_browser()
+    raise last_err
 
-        if count == 0:
-            if progress:
-                await progress.update("Перезагрузка...")
-            await reload_page(p)
-            return await fetch_data(p, lock, False, progress)
 
-        result = {}
+def _cache_fresh() -> bool:
+    return bool(_cache["snap"]) and time.monotonic() - _cache["ts"] < CACHE_TTL
 
-        for i in range(count):
-            if progress:
-                await progress.update(f"Обрабатываю день {i+1}/{count}...")
-            tab = tabs.nth(i)
-            await tab.click(timeout=5000)
-            data = await p.evaluate(analysis_script)
 
-            if data and data.get("dateId"):
-                result[data["dateId"]] = data
+async def get_snapshot(force=False):
+    async with fetch_lock:
+        if not force and _cache_fresh():
+            return _cache["snap"]
 
-        if progress:
-            await progress.update("Анализирую данные...")
-        return result        
+        fact, attention = await fetch_fact()
+        schedules = parse_schedules(fact)
+        if not schedules:
+            raise RuntimeError(f"Group {GROUP} not found in fact data")
 
-# =============================
-# ⏳ Расчет времени
-# =============================
+        snap = {
+            "schedules": schedules,
+            "updated": fact.get("update", "---"),
+            "attention": attention,
+        }
+        _cache["ts"] = time.monotonic()
+        _cache["snap"] = snap
+        return snap
+
+
+# ============================= TIME CALC =============================
 def h_str(h):
     return str(int(h)) if h % 1 == 0 else str(h)
+
+
 def format_time(h, m):
     if h == 0 and m == 0:
         return "меньше минуты"
@@ -223,244 +261,188 @@ def format_time(h, m):
         return f"{h}ч"
     return f"{h}ч {m} мин"
 
-def calculate_time_left(schedules):
-    if not schedules:
-        return "Нет данных для расчета."
 
-    tz = pytz.timezone('Europe/Kiev')
-    now = datetime.now(tz)
+def calculate_time_left(schedules: dict) -> str:
+    now = now_kyiv()
+    by_date = {d["date"]: d for d in schedules.values()}
 
-    sorted_rels = sorted(schedules.keys())
-    today_rel = sorted_rels[0]
-    raw_today = schedules[today_rel].get('raw_statuses', [])
-    
-    if not raw_today:
-        return "График на сегодня пуст."
+    today = by_date.get(now.date())
+    if not today:
+        return "⚠️ <b>На сайте пока нет графика на сегодня.</b>\n"
+    tomorrow = by_date.get(now.date() + timedelta(days=1))
 
-    # Собираем общую линию времени (сегодня + завтра если есть)
-    raw_tomorrow = []
-    if len(sorted_rels) > 1:
-        raw_tomorrow = schedules[sorted_rels[1]].get('raw_statuses', [])
-    
-    full_timeline = raw_today + raw_tomorrow
+    timeline = today["slots"] + (tomorrow["slots"] if tomorrow else [])
     minutes_now = now.hour * 60 + now.minute
-    current_idx = minutes_now // 30
-    if current_idx >= len(raw_today):
-        return "Сегодняшний график уже не актуален."
+    idx = minutes_now // 30
+    current = timeline[idx]
 
-    current_state = full_timeline[current_idx]
-    
-    # --- Логика поиска изменений ---
-    events = []
-    temp_state = current_state
-    
-    # Ищем два ближайших изменения статуса
-    for i in range(current_idx + 1, len(full_timeline)):
-        if full_timeline[i] != temp_state:
-            diff = (i * 30) - minutes_now
-            h, m = diff // 60, diff % 60
-            
-            label = "<b>До включения</b>" if full_timeline[i] == "🟢" else "<b>До выключения</b>"
-            events.append(f" ↳ {label}: {format_time(h, m)}")
-            
-            temp_state = full_timeline[i]
-            if len(events) >= 2: # Нам нужно только два ближайших события
+    events, state = [], current
+    for i in range(idx + 1, len(timeline)):
+        if timeline[i] != state:
+            diff = i * 30 - minutes_now
+            label = "<b>До включения</b>" if timeline[i] == "🟢" else "<b>До выключения</b>"
+            events.append(f" ↳ {label}: {format_time(diff // 60, diff % 60)}")
+            state = timeline[i]
+            if len(events) >= 2:
                 break
 
-    # --- Сборка сообщения ---
-    status_text = "🔋 Свет есть" if current_state == "🟢" else "🪫 Света отключен"
-    
-    res = f"💡 <b>ИНФОРМАЦИЯ ПО СЕТИ</b>\n"
-    res += f" ↳ <b>Сейчас</b>: {status_text}\n"
-    
-    # Добавляем найденные события
-    if events:
-        res += "\n".join(events) + "\n"
-    else:
-        res += " ↳ ✨<b>Отключений не планируется</b>\n"
+    status = "🔋 Свет есть" if current == "🟢" else "🪫 Света нет"
+    res = "💡 <b>ИНФОРМАЦИЯ ПО СЕТИ</b>\n"
+    res += f" ↳ <b>Сейчас</b>: {status}\n"
+    res += ("\n".join(events) + "\n") if events else " ↳ ✨<b>Отключений не планируется</b>\n"
 
-    # --- Статистика ---
-    today_off = raw_today.count("🔴") / 2
-    today_on = raw_today.count("🟢") / 2
-    
-    res += f"📊 <b>Статистика</b>\n"
-    res += f" ↳ <b>Сегодня</b>: 🔋 {h_str(today_on)} ч | 🪫 {h_str(today_off)} ч\n"
-
-    if raw_tomorrow:
-        tomorrow_off = raw_tomorrow.count("🔴") / 2
-        tomorrow_on = raw_tomorrow.count("🟢") / 2
-        res += f" ↳ <b>Завтра</b>: 🔋 {h_str(tomorrow_on)} ч | 🪫 {h_str(tomorrow_off)} ч\n"
-
+    res += "📊 <b>Статистика</b>\n"
+    res += (f" ↳ <b>Сегодня</b>: 🔋 {h_str(today['slots'].count('🟢') / 2)} ч | "
+            f"🪫 {h_str(today['slots'].count('🔴') / 2)} ч\n")
+    if tomorrow:
+        res += (f" ↳ <b>Завтра</b>: 🔋 {h_str(tomorrow['slots'].count('🟢') / 2)} ч | "
+                f"🪫 {h_str(tomorrow['slots'].count('🔴') / 2)} ч\n")
     return res
-# =============================
-# 📡 Мониторинг (КД 60 сек) - ИСПРАВЛЕННЫЙ
-# =============================
-async def monitoring_task():
-    global last_monitor_reload, current_attention_text
-    while True:
-        try:
-            await asyncio.sleep(300) # Проверка каждые 5 минут
-            users = redis.smembers("monitoring_users")
-            if not users: continue
 
-            now = datetime.now()
-            should_reload = (last_monitor_reload is None or 
-                           (now - last_monitor_reload) > timedelta(seconds=120))
-            
-            if should_reload:
-                last_monitor_reload = now
 
-            schedules = await fetch_data(page_monitor, lock_monitor, force=should_reload)
-            if not schedules: continue
-
-            # Проверяем, изменился ли график ХОТЯ БЫ для одного дня в глобальном кэше
-            has_real_change = False
-            for rel, data in schedules.items():
-                cache_key = f"global_sched:{rel}" # Общий ключ для всех
-                cached = redis.get(cache_key)
-                cached_str = cached.decode() if isinstance(cached, bytes) else cached
-
-                if cached_str is not None and cached_str != data["schedule"]:
-                    has_real_change = True
-                
-                # Обновляем глобальный кэш
-                redis.set(cache_key, data["schedule"], ex=172800)
-
-            # Обновляем общий текст внимания
-            first_day_rel = sorted(schedules.keys())[0]
-            current_attention_text = schedules[first_day_rel].get('attention', "Інформація відсутня.")
-
-            if has_real_change:
-                logging.info("📢 Зафиксировано изменение графика! Рассылка...")
-                
-                # Формируем ОДНО сообщение для всех
-                ans = calculate_time_left(schedules)
-                unified_schedule = ""
-                for rel in sorted(schedules.keys()):
-                    d = schedules[rel]
-                    unified_schedule += f"⚡{d['dateText']}⚡\n{d['schedule']}\n\n"
-
-                raw_time = schedules[first_day_rel]['updateTime']
-                clean_time = raw_time.split(": ")[-1] if ": " in raw_time else raw_time
-                
-                msg = (
-                    "🔔 <b>ГРАФИК ИЗМЕНИЛСЯ</b>\n"
-                    f"<pre>{unified_schedule.strip()}</pre>\n"
-                    f"{ans}"
-                    f"<pre>🕒 Обновлено: {clean_time}</pre>"
-                )
-
-                # Кнопка для всех
-                builder = InlineKeyboardBuilder()
-                builder.row(types.InlineKeyboardButton(text="🔹 Информация на сегодня", callback_data="show_att"))
-
-                # Рассылка по списку юзеров
-                for uid_bytes in users:
-                    uid = uid_bytes.decode() if isinstance(uid_bytes, bytes) else uid_bytes
-                    try:
-                        await bot.send_message(int(uid), msg, reply_markup=builder.as_markup(), parse_mode="HTML")
-                        await asyncio.sleep(0.05) # Защита от спам-фильтра Telegram
-                    except Exception as e:
-                        logging.error(f"Ошибка рассылки юзеру {uid}: {e}")
-
-        except Exception as e:
-            logging.error(f"⚠️ Ошибка в мониторинге: {e}")
-            await asyncio.sleep(30)
-# =============================
-# 🤖 Обработка юзера
-# =============================
-@dp.message(F.text.contains("график") | F.text.contains("Показать"))
-async def manual(m: types.Message):
-    msg = await m.answer("◐ Запуск...")
-    spinner = ProgressSpinner(msg)
-    await spinner.start()
-
-    try:
-        schedules = await fetch_data(page_user, lock_user, force=True, progress=spinner)
-        if not schedules:
-            await spinner.stop()
-            await msg.edit_text("❌ <b>Ошибка:</b> Не удалось получить данные.")
-            return
-
-        # Собираем все графики в один блок <pre>
-        unified_schedule = ""
-        sorted_keys = sorted(schedules.keys())
-        for rel in sorted_keys:
-            d = schedules[rel]
-            unified_schedule += f"⚡{d['dateText']}⚡\n{d['schedule']}\n\n"
-
-        # Сохраняем текст уведомления для кнопки
-        global current_attention_text
-        current_attention_text = schedules[sorted_keys[0]].get('attention', "Информация отсутствует.")
-        ans = calculate_time_left(schedules)
-        raw_time = schedules[sorted_keys[0]]['updateTime']
-        clean_time = raw_time.split(": ")[-1] if ": " in raw_time else raw_time
-
-        full_text = f"💡<b>ГРАФИК ОТКЛЮЧЕНИЙ</b>\n"
-        full_text += f"<pre>{unified_schedule.strip()}</pre>\n"
-        full_text += ans
-        full_text += f"<pre>🕒 <b>Обновлено:</b> {clean_time}</pre>"
-
-        # Создаем кнопку
-        builder = InlineKeyboardBuilder()
-        builder.row(types.InlineKeyboardButton(text="📢 Уведомление Укрэнерго", callback_data="show_att"))
-
-        await spinner.stop()
-        await msg.edit_text(full_text, reply_markup=builder.as_markup(), parse_mode="HTML")
-
-    except Exception as e:
-        await spinner.stop()
-        logging.error(e)
-        await msg.edit_text("⚠️ <b>Произошла критическая ошибка при парсинге.</b>")
-@dp.callback_query(F.data == "show_att")
-async def callback_att(call: types.CallbackQuery):
-    # Отправляем сообщение и сохраняем объект сообщения в переменную 'info_msg'
-    info_msg = await call.message.answer(
-        f"📢 <b>Уведомление Укрэнерго:</b>\n\n{current_attention_text}", 
-        parse_mode="HTML"
+def render_message(snap: dict, header: str) -> str:
+    now = now_kyiv()
+    blocks = "\n\n".join(
+        f"⚡{day_title(d['date'], now)}⚡\n{d['text']}" for d in snap["schedules"].values()
     )
-    await call.answer() # Убираем "часики" с кнопки
+    return (
+        f"{header}\n"
+        f"<pre>{blocks}</pre>\n"
+        f"{calculate_time_left(snap['schedules'])}"
+        f"<pre>🕒 Обновлено: {html.escape(snap['updated'])}</pre>"
+    )
 
-    # Запускаем фоновую задачу удаления, чтобы не блокировать бота
-    asyncio.create_task(delete_message_after(info_msg, 120)) # 120 секунд (2 минуты)
+
+# ============================= UI HELPERS =============================
+async def delete_message_after(message: types.Message, sleep_time: int):
+    await asyncio.sleep(sleep_time)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
 
 def get_kb():
     return types.ReplyKeyboardMarkup(
-        keyboard=[[types.KeyboardButton(text="⚡ Показать график")], [types.KeyboardButton(text="🔔 Мониторинг")]], 
-        resize_keyboard=True
+        keyboard=[[types.KeyboardButton(text="⚡ Показать график")],
+                  [types.KeyboardButton(text="🔔 Мониторинг")]],
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие в меню 👇",
     )
 
+
+# ============================= MONITORING =============================
+async def monitoring_task():
+    while True:
+        try:
+            users = await rcall(redis_client.smembers, "monitoring_users")
+            if users:
+                snap = await get_snapshot(force=True)
+
+                changed = False
+                for ts, d in snap["schedules"].items():
+                    key = f"sched2:{GROUP}:{ts}"
+                    old = _s(await rcall(redis_client.get, key))
+                    if old is not None and old != d["sig"]:
+                        changed = True
+                    await rcall(redis_client.set, key, d["sig"], ex=172800)
+
+                if changed:
+                    logging.info("📢 Schedule changed, notifying users")
+                    msg = render_message(snap, "🔔 <b>ГРАФИК ИЗМЕНИЛСЯ</b>")
+                    builder = InlineKeyboardBuilder()
+                    builder.row(types.InlineKeyboardButton(
+                        text="🔹 Информация на сегодня", callback_data="show_att"))
+
+                    for uid in users:
+                        try:
+                            await bot.send_message(int(_s(uid)), msg,
+                                                   reply_markup=builder.as_markup(),
+                                                   parse_mode="HTML")
+                            await asyncio.sleep(0.05)
+                        except Exception as e:
+                            logging.error("Broadcast to %s failed: %s", uid, e)
+        except Exception as e:
+            logging.error("⚠️ Monitoring error: %s", e)
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
+# ============================= HANDLERS =============================
 @dp.message(Command("start"))
 async def start_cmd(m: types.Message):
     await m.answer("Бот запущен.", reply_markup=get_kb())
 
+
+@dp.message(F.text.contains("график") | F.text.contains("Показать"))
+async def manual(m: types.Message):
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(
+        text="📢 Уведомление Укрэнерго", callback_data="show_att"))
+
+    if _cache_fresh():
+        await m.answer(render_message(_cache["snap"], "💡<b>ГРАФИК ОТКЛЮЧЕНИЙ</b>"),
+                       reply_markup=builder.as_markup(), parse_mode="HTML")
+        return
+
+    msg = await m.answer("⏳ Загрузка...")
+    try:
+        snap = await get_snapshot()
+    except Exception:
+        logging.exception("Manual fetch failed")
+        await msg.edit_text("❌ <b>Ошибка:</b> не удалось получить данные с сайта.",
+                            parse_mode="HTML")
+        return
+    await msg.edit_text(render_message(snap, "💡<b>ГРАФИК ОТКЛЮЧЕНИЙ</b>"),
+                        reply_markup=builder.as_markup(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "show_att")
+async def callback_att(call: types.CallbackQuery):
+    snap = _cache["snap"]
+    text = snap["attention"] if snap else "Информация отсутствует."
+    info_msg = await call.message.answer(
+        f"📢 <b>Уведомление Укрэнерго:</b>\n\n{html.escape(text)}", parse_mode="HTML")
+    await call.answer()
+    asyncio.create_task(delete_message_after(info_msg, 120))
+
+
 @dp.message(F.text.contains("мониторинг") | F.text.contains("Мониторинг") | F.text.contains("🔔"))
 async def toggle(m: types.Message):
     uid = str(m.from_user.id)
-    if redis.sismember("monitoring_users", uid):
-        redis.srem("monitoring_users", uid)
+    if await rcall(redis_client.sismember, "monitoring_users", uid):
+        await rcall(redis_client.srem, "monitoring_users", uid)
         await m.answer("Мониторинг выключен.")
     else:
-        redis.sadd("monitoring_users", uid)
+        await rcall(redis_client.sadd, "monitoring_users", uid)
         await m.answer("Мониторинг включен.")
+
+
 @dp.message(F.text)
 async def default_handler(m: types.Message):
-    kb = [
-        [types.KeyboardButton(text="⚡ Показать график")],
-        [types.KeyboardButton(text="🔔 Мониторинг")]
-    ]
-    keyboard = types.ReplyKeyboardMarkup(
-        keyboard=kb,
-        resize_keyboard=True,
-        input_field_placeholder="Выберите действие в меню 👇"
-    )
-    
-    await m.answer("Пожалуйста, выберите действие из меню ниже:", reply_markup=keyboard)
+    await m.answer("Пожалуйста, выберите действие из меню ниже:", reply_markup=get_kb())
 
-async def main():   
-    await start_browser()
-    asyncio.create_task(monitoring_task())
-    await dp.start_polling(bot)
+
+# ============================= MAIN =============================
+async def warm_up():
+    try:
+        await get_snapshot(force=True)
+        logging.info("✅ Warm-up done")
+    except Exception:
+        logging.exception("Warm-up failed (will retry on demand)")
+
+
+async def main():
+    background = [
+        asyncio.create_task(warm_up()), 
+        asyncio.create_task(monitoring_task())
+    ]
+    try:
+        await dp.start_polling(bot)
+    finally:
+        for t in background:
+            t.cancel()
+        await stop_browser()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
