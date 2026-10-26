@@ -215,13 +215,8 @@ async def fetch_fact():
         
     raise last_err
 
-async def _load_html(fast: bool) -> str:
-    global _block_assets
-    _block_assets = fast
-    if fast:
-        resp = await page.goto(SITE_URL, wait_until="commit", timeout=20000)
-        return await resp.text() if resp else await page.content()
-
+async def _load_html() -> str:
+    """Полная загрузка страницы с ожиданием появления данных графиков."""
     await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=30000)
     try:
         await page.wait_for_function(
