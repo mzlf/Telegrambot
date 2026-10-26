@@ -30,7 +30,7 @@ SITE_URL = "https://www.dtek-krem.com.ua/ua/shutdowns"
 SITE_HOST = "dtek-krem.com.ua"
 HEADLESS = os.getenv("HEADLESS", "1") == "1"
 CHECK_INTERVAL = 300
-CACHE_TTL = 900                       # Кэш на 15 минут (чтобы пользователи получали график мгновенно)
+CACHE_TTL = 90                      # Кэш на 15 минут (чтобы пользователи получали график мгновенно)
 DEFAULT_ATTENTION = "Актуальних повідомлень немає."
 TZ = pytz.timezone("Europe/Kiev")
 
