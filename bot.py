@@ -194,30 +194,26 @@ async def stop_browser():
 
 
 async def fetch_fact():
-    """Return (fact_dict, attention_text). Fast mode first, full page load as fallback."""
-    global _fast_disabled_until
-    modes = (True, False) if time.monotonic() >= _fast_disabled_until else (False,)
     last_err = RuntimeError("DisconSchedule.fact not found on the page")
 
     try:
-        for fast in modes:
-            try:
-                if page is None:
-                    await start_browser()
-                text = await _load_html(fast)
-                fact = extract_fact_from_html(text)
-                if fact and "data" in fact:
-                    if not fast and len(modes) == 2:
-                        _fast_disabled_until = time.monotonic() + FAST_RETRY_AFTER
-                        logging.warning("Fast mode failed but full load worked - using full load for a while")
-                    return fact, extract_attention_from_html(text)
-                logging.warning("DisconSchedule.fact not in response (fast=%s)", fast)
-            except Exception as e:
-                last_err = e
-                logging.error("Fetch failed (fast=%s): %s", fast, e)
-        raise last_err
-    finally:
-        await stop_browser()
+        if page is None:
+            await start_browser()
+        
+        # Сразу делаем полноценную загрузку (без блокировки ассетов)
+        text = await _load_html(fast=False)
+        fact = extract_fact_from_html(text)
+        
+        if fact and "data" in fact:
+            return fact, extract_attention_from_html(text)
+            
+        logging.warning("DisconSchedule.fact not in response")
+    except Exception as e:
+        last_err = e
+        logging.error("Fetch failed: %s", e)
+        await stop_browser()   # перезапуск браузера при ошибке
+        
+    raise last_err
 
 async def _load_html(fast: bool) -> str:
     global _block_assets
