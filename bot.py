@@ -1,5 +1,5 @@
 """
-DTEK Kyiv-region outage bot - Optimized, Anti-Bot & Low RAM usage.
+DTEK Kyiv-region outage bot - Optimized, Anti-Bot, Web-Server for UptimeRobot.
 """
 import asyncio
 import html
@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 
 import pytz
 import redis
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -29,7 +30,7 @@ SITE_URL = "https://www.dtek-krem.com.ua/ua/shutdowns"
 SITE_HOST = "dtek-krem.com.ua"
 HEADLESS = os.getenv("HEADLESS", "1") == "1"
 CHECK_INTERVAL = 300
-CACHE_TTL = 60                        # Увеличили TTL кэша до 60 сек, чтобы снизить нагрузку
+CACHE_TTL = 900                       # Кэш на 15 минут (чтобы пользователи получали график мгновенно)
 DEFAULT_ATTENTION = "Актуальних повідомлень немає."
 TZ = pytz.timezone("Europe/Kiev")
 
@@ -46,7 +47,7 @@ redis_client = redis.Redis(
 
 logging.basicConfig(level=logging.INFO)
 
-# browser state (держим инстанс запущенным для мгновенных ответов)
+# browser state
 playwright = None
 browser = None
 context = None
@@ -134,7 +135,7 @@ def day_title(d, now) -> str:
     return f"{label} {d.strftime('%d.%m.%Y')}"
 
 
-# ============================= BROWSER (STEALTH & LOW-RAM) =============================
+# ============================= BROWSER =============================
 async def start_browser():
     global playwright, browser, context
     if browser:
@@ -171,15 +172,12 @@ async def stop_browser():
         pass
     playwright = browser = context = None
 
+
 async def _load_html() -> str:
-    """Полная загрузка страницы с ожиданием появления данных графиков."""
     page = await context.new_page()
     try:
-        # Убираем признаки автоматизации
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        
         await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=25000)
-        
         await page.wait_for_function(
             "() => typeof DisconSchedule !== 'undefined' && !!DisconSchedule.fact",
             timeout=12000,
@@ -188,21 +186,20 @@ async def _load_html() -> str:
     finally:
         await page.close()
 
+
 async def fetch_fact():
-    """Загружает страницу и парсит данные."""
     await start_browser()
     try:
-        text = await _load_html() # Исправлено: вызываем без аргументов
+        text = await _load_html()
         fact = extract_fact_from_html(text)
-        
         if fact and "data" in fact:
             return fact, extract_attention_from_html(text)
-            
         raise RuntimeError("DisconSchedule.fact not found in page content")
     except Exception as e:
         logging.error("Fetch failed: %s", e)
         await stop_browser()
         raise e
+
 
 def _cache_fresh() -> bool:
     return bool(_cache["snap"]) and time.monotonic() - _cache["ts"] < CACHE_TTL
@@ -360,22 +357,17 @@ async def manual(m: types.Message):
     builder.row(types.InlineKeyboardButton(
         text="📢 Уведомление Укрэнерго", callback_data="show_att"))
 
-    # Если кеш свежий — отдает МГНОВЕННО без единого обращения к браузеру!
-    if _cache_fresh():
-        await m.answer(render_message(_cache["snap"], "💡<b>ГРАФИК ОТКЛЮЧЕНИЙ</b>"),
-                       reply_markup=builder.as_markup(), parse_mode="HTML")
-        return
+    # Мгновенная выдача из кэша без ожидания парсинга сайта
+    snap = _cache["snap"]
+    if not snap:
+        try:
+            snap = await get_snapshot()
+        except Exception:
+            await m.answer("❌ <b>Ошибка:</b> график временно недоступен, попробуйте через минуту.", parse_mode="HTML")
+            return
 
-    msg = await m.answer("⏳ Загрузка...")
-    try:
-        snap = await get_snapshot()
-    except Exception:
-        logging.exception("Manual fetch failed")
-        await msg.edit_text("❌ <b>Ошибка:</b> не удалось получить данные с сайта.",
-                            parse_mode="HTML")
-        return
-    await msg.edit_text(render_message(snap, "💡<b>ГРАФИК ОТКЛЮЧЕНИЙ</b>"),
-                        reply_markup=builder.as_markup(), parse_mode="HTML")
+    await m.answer(render_message(snap, "💡<b>ГРАФИК ОТКЛЮЧЕНИЙ</b>"),
+                   reply_markup=builder.as_markup(), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "show_att")
@@ -404,6 +396,23 @@ async def default_handler(m: types.Message):
     await m.answer("Пожалуйста, выберите действие из меню ниже:", reply_markup=get_kb())
 
 
+# ============================= WEB SERVER FOR UPTIMEROBOT =============================
+async def handle_ping(request):
+    return web.Response(text="Bot is alive and running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/health", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"🌐 HTTP Ping server started on port {port}")
+
+
 # ============================= MAIN =============================
 async def warm_up():
     try:
@@ -416,7 +425,8 @@ async def warm_up():
 async def main():
     background = [
         asyncio.create_task(warm_up()), 
-        asyncio.create_task(monitoring_task())
+        asyncio.create_task(monitoring_task()),
+        asyncio.create_task(start_web_server())  # Запуск веб-сервера для UptimeRobot
     ]
     try:
         await dp.start_polling(bot)
