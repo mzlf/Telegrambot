@@ -148,6 +148,7 @@ def day_title(d, now) -> str:
 
 
 # ============================= BROWSER =============================
+# ============================= BROWSER =============================
 async def _route_handler(route):
     try:
         req = route.request
@@ -163,7 +164,18 @@ async def _route_handler(route):
 async def start_browser():
     global playwright, browser, page
     playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch(headless=True)
+    # ДОБАВЛЕНЫ КРИТИЧЕСКИЕ ФЛАГИ ДЛЯ EKONOMИИ ПАМЯТИ В LINUX/DOCKER
+    browser = await playwright.chromium.launch(
+        headless=HEADLESS,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--no-zygote",
+            "--single-process" # помогает экономить RAM на слабых серверах
+        ]
+    )
     context = await browser.new_context(user_agent="Mozilla/5.0")
     await context.route("**/*", _route_handler)
     page = await context.new_page()
@@ -180,6 +192,32 @@ async def stop_browser():
         pass
     playwright = browser = page = None
 
+
+async def fetch_fact():
+    """Return (fact_dict, attention_text). Fast mode first, full page load as fallback."""
+    global _fast_disabled_until
+    modes = (True, False) if time.monotonic() >= _fast_disabled_until else (False,)
+    last_err = RuntimeError("DisconSchedule.fact not found on the page")
+
+    try:
+        for fast in modes:
+            try:
+                if page is None:
+                    await start_browser()
+                text = await _load_html(fast)
+                fact = extract_fact_from_html(text)
+                if fact and "data" in fact:
+                    if not fast and len(modes) == 2:
+                        _fast_disabled_until = time.monotonic() + FAST_RETRY_AFTER
+                        logging.warning("Fast mode failed but full load worked - using full load for a while")
+                    return fact, extract_attention_from_html(text)
+                logging.warning("DisconSchedule.fact not in response (fast=%s)", fast)
+            except Exception as e:
+                last_err = e
+                logging.error("Fetch failed (fast=%s): %s", fast, e)
+        raise last_err
+    finally:
+        await stop_browser()
 
 async def _load_html(fast: bool) -> str:
     global _block_assets
@@ -198,29 +236,6 @@ async def _load_html(fast: bool) -> str:
         logging.warning("Full load: DisconSchedule.fact did not appear (%s)", e)
     return await page.content()
 
-
-async def fetch_fact():
-    global _fast_disabled_until
-    modes = (True, False) if time.monotonic() >= _fast_disabled_until else (False,)
-    last_err = RuntimeError("DisconSchedule.fact not found on the page")
-
-    for fast in modes:
-        try:
-            if page is None:
-                await start_browser()
-            text = await _load_html(fast)
-            fact = extract_fact_from_html(text)
-            if fact and "data" in fact:
-                if not fast and len(modes) == 2:
-                    _fast_disabled_until = time.monotonic() + FAST_RETRY_AFTER
-                    logging.warning("Fast mode failed but full load worked - using full load for a while")
-                return fact, extract_attention_from_html(text)
-            logging.warning("DisconSchedule.fact not in response (fast=%s)", fast)
-        except Exception as e:
-            last_err = e
-            logging.error("Fetch failed (fast=%s): %s", fast, e)
-            await stop_browser()
-    raise last_err
 
 
 def _cache_fresh() -> bool:
