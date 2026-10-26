@@ -2,3 +2,4 @@ aiogram
 playwright
 pytz
 upstash-redis
+redis
