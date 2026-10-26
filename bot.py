@@ -148,10 +148,9 @@ async def start_browser():
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--no-zygote",
-            "--disable-blink-features=AutomationControlled",  # Убирает метку бота
+            "--disable-blink-features=AutomationControlled",
         ]
     )
-    # Создаем контекст с реальными параметрами живого пользователя (анти-бот)
     context = await browser.new_context(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         viewport={"width": 1920, "height": 1080},
@@ -172,32 +171,38 @@ async def stop_browser():
         pass
     playwright = browser = context = None
 
-
-async def fetch_fact():
-    """Загружает страницу с обходом защит и парсит данные."""
-    await start_browser()
+async def _load_html() -> str:
+    """Полная загрузка страницы с ожиданием появления данных графиков."""
     page = await context.new_page()
     try:
-        # Убираем признаки автоматизации (navigator.webdriver = false)
+        # Убираем признаки автоматизации
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
         await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=25000)
         
-        # Ждем появления объекта расписания от скриптов сайта
         await page.wait_for_function(
             "() => typeof DisconSchedule !== 'undefined' && !!DisconSchedule.fact",
             timeout=12000,
         )
-        text = await page.content()
+        return await page.content()
+    finally:
+        await page.close()
+
+async def fetch_fact():
+    """Загружает страницу и парсит данные."""
+    await start_browser()
+    try:
+        text = await _load_html() # Исправлено: вызываем без аргументов
         fact = extract_fact_from_html(text)
         
         if fact and "data" in fact:
             return fact, extract_attention_from_html(text)
             
         raise RuntimeError("DisconSchedule.fact not found in page content")
-    finally:
-        await page.close()  # Закрываем вкладку, чтобы не текла память
-
+    except Exception as e:
+        logging.error("Fetch failed: %s", e)
+        await stop_browser()
+        raise e
 
 def _cache_fresh() -> bool:
     return bool(_cache["snap"]) and time.monotonic() - _cache["ts"] < CACHE_TTL
