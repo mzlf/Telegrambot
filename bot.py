@@ -30,8 +30,8 @@ SITE_URL = "https://www.dtek-krem.com.ua/ua/shutdowns"
 SITE_HOST = "dtek-krem.com.ua"
 HEADLESS = os.getenv("HEADLESS", "1") == "1"
 CHECK_INTERVAL = 300
-CACHE_TTL = 90                      # Кэш на 15 минут (чтобы пользователи получали график мгновенно)
-DEFAULT_ATTENTION = "Актуальних повідомлень немає."
+CACHE_TTL = 90                     # Кэш на 15 минут (чтобы пользователи получали график мгновенно)
+DEFAULT_ATTENTION = "Актуальных повідомлень немає."
 TZ = pytz.timezone("Europe/Kiev")
 
 bot = Bot(token=TOKEN)
@@ -252,7 +252,7 @@ def calculate_time_left(schedules: dict) -> str:
     timeline = today["slots"] + (tomorrow["slots"] if tomorrow else [])
     minutes_now = now.hour * 60 + now.minute
     idx = minutes_now // 30
-    current = timeline[idx]
+    current = timeline[idx] if idx < len(timeline) else "🟢"
 
     events, state = [], current
     for i in range(idx + 1, len(timeline)):
@@ -280,12 +280,32 @@ def calculate_time_left(schedules: dict) -> str:
 
 def render_message(snap: dict, header: str) -> str:
     now = now_kyiv()
-    blocks = "\n\n".join(
-        f"⚡{day_title(d['date'], now)}⚡\n{d['text']}" for d in snap["schedules"].values()
-    )
+    by_date = {d["date"]: d for d in snap["schedules"].values()}
+    today_date = now.date()
+    tomorrow_date = today_date + timedelta(days=1)
+
+    today = by_date.get(today_date)
+    tomorrow = by_date.get(tomorrow_date)
+
+    blocks = []
+    
+    # Блок на сегодня
+    if today:
+        blocks.append(f"⚡{day_title(today['date'], now)}⚡\n{today['text']}")
+    else:
+        blocks.append(f"⚡на сегодня {today_date.strftime('%d.%m.%Y')}⚡\n⚠️ График на сегодня отсутствует, нужно подождать пока появится")
+
+    # Блок на завтра
+    if tomorrow:
+        blocks.append(f"⚡{day_title(tomorrow['date'], now)}⚡\n{tomorrow['text']}")
+    else:
+        blocks.append(f"⚡на завтра {tomorrow_date.strftime('%d.%m.%Y')}⚡\n⚠️ График на завтра отсутствует, нужно подождать пока появится")
+
+    blocks_str = "\n\n".join(blocks)
+
     return (
         f"{header}\n"
-        f"<pre>{blocks}</pre>\n"
+        f"<pre>{blocks_str}</pre>\n"
         f"{calculate_time_left(snap['schedules'])}"
         f"<pre>🕒 Обновлено: {html.escape(snap['updated'])}</pre>"
     )
