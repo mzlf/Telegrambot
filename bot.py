@@ -27,10 +27,9 @@ REDIS_PASSWORD = "ZZjNkOsY6RK6iojvs721XY8sYB8c4fHM"
 
 GROUP = "GPV4.1"
 SITE_URL = "https://www.dtek-krem.com.ua/ua/shutdowns"
-SITE_HOST = "dtek-krem.com.ua"
 HEADLESS = os.getenv("HEADLESS", "1") == "1"
 CHECK_INTERVAL = 300
-CACHE_TTL = 90                     # Кэш на 15 минут (чтобы пользователи получали график мгновенно)
+CACHE_TTL = 90
 DEFAULT_ATTENTION = "Актуальных повідомлень немає."
 TZ = pytz.timezone("Europe/Kiev")
 
@@ -135,7 +134,7 @@ def day_title(d, now) -> str:
     return f"{label} {d.strftime('%d.%m.%Y')}"
 
 
-# ============================= BROWSER =============================
+# ============================= BROWSER (RAM OPTIMIZED) =============================
 async def start_browser():
     global playwright, browser, context
     if browser:
@@ -149,12 +148,15 @@ async def start_browser():
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--no-zygote",
+            "--single-process",  # Экономия памяти на слабых VPS/Render
+            "--disable-extensions",
+            "--disable-accelerated-2d-canvas",
             "--disable-blink-features=AutomationControlled",
         ]
     )
     context = await browser.new_context(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        viewport={"width": 1920, "height": 1080},
+        viewport={"width": 1280, "height": 720},
         device_scale_factor=1,
     )
 
@@ -177,14 +179,14 @@ async def _load_html() -> str:
     page = await context.new_page()
     try:
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=25000)
+        await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_function(
             "() => typeof DisconSchedule !== 'undefined' && !!DisconSchedule.fact",
-            timeout=12000,
+            timeout=20000,
         )
         return await page.content()
     finally:
-        await page.close()
+        await page.close() # Жестко закрываем страницу, чтобы не текла память
 
 
 async def fetch_fact():
@@ -289,13 +291,11 @@ def render_message(snap: dict, header: str) -> str:
 
     blocks = []
     
-    # Блок на сегодня
     if today:
         blocks.append(f"⚡{day_title(today['date'], now)}⚡\n{today['text']}")
     else:
-        blocks.append(f"⚡на сегодня {today_date.strftime('%d.%m.%Y')}⚡\n⚠️ График на сегодня отсутствует, нужно подождать пока появится")
+        blocks.append(f"⚡на сегодня {today_date.strftime('%d.%m.%Y')}⚡\n⚠️ График на сегодня отсутствует")
 
-    # Блок на завтра
     if tomorrow:
         blocks.append(f"⚡{day_title(tomorrow['date'], now)}⚡\n{tomorrow['text']}")
     else:
@@ -341,12 +341,17 @@ async def monitoring_task():
                 for ts, d in snap["schedules"].items():
                     key = f"sched2:{GROUP}:{ts}"
                     old = _s(await rcall(redis_client.get, key))
-                    if old is not None and old != d["sig"]:
+                    
+                    # Если ключа не было РЕАЛЬНО (например, появился завтрашний день) ИЛИ старый график отличается
+                    if old is None:
                         changed = True
+                    elif old != d["sig"]:
+                        changed = True
+                        
                     await rcall(redis_client.set, key, d["sig"], ex=172800)
 
                 if changed:
-                    logging.info("📢 Schedule changed, notifying users")
+                    logging.info("📢 Schedule changed or new day added, notifying users")
                     msg = render_message(snap, "🔔 <b>ГРАФИК ИЗМЕНИЛСЯ</b>")
                     builder = InlineKeyboardBuilder()
                     builder.row(types.InlineKeyboardButton(
@@ -361,7 +366,7 @@ async def monitoring_task():
                         except Exception as e:
                             logging.error("Broadcast to %s failed: %s", uid, e)
         except Exception as e:
-            logging.error("⚠️ Monitoring error: %s", e)
+            logging.warning("⚠️ Monitoring skipped due to network/site lag: %s", e)
         await asyncio.sleep(CHECK_INTERVAL)
 
 
@@ -377,7 +382,6 @@ async def manual(m: types.Message):
     builder.row(types.InlineKeyboardButton(
         text="📢 Уведомление Укрэнерго", callback_data="show_att"))
 
-    # Мгновенная выдача из кэша без ожидания парсинга сайта
     snap = _cache["snap"]
     if not snap:
         try:
@@ -446,7 +450,7 @@ async def main():
     background = [
         asyncio.create_task(warm_up()), 
         asyncio.create_task(monitoring_task()),
-        asyncio.create_task(start_web_server())  # Запуск веб-сервера для UptimeRobot
+        asyncio.create_task(start_web_server())
     ]
     try:
         await dp.start_polling(bot)
