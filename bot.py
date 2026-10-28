@@ -33,6 +33,9 @@ CACHE_TTL = 90
 DEFAULT_ATTENTION = "Актуальных повідомлень немає."
 TZ = pytz.timezone("Europe/Kiev")
 
+# Юзеры со смещением времени на +1 час
+OFFSET_USERS = {1437149670, 1016062199}
+
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
@@ -97,16 +100,16 @@ def day_to_slots(day: dict) -> list:
     return slots
 
 
-def slots_to_text(slots: list) -> str:
+def slots_to_text(slots: list, hour_offset: int = 0) -> str:
     def fmt(i):
-        m = i * 30
-        return f"{m // 60:02d}:{m % 60:02d}"
+        m = (i + hour_offset * 2) * 30
+        return f"{(m // 60) % 24:02d}:{m % 60:02d}"
 
     lines, start = [], 0
     for i in range(1, 49):
         if i == 48 or slots[i] != slots[start]:
             if slots[start] == "🔴":
-                end = "00:00" if i == 48 else fmt(i)
+                end = fmt(48) if i == 48 else fmt(i)
                 lines.append(f"🔴{fmt(start)} — {end}🔴")
             start = i
     return "\n".join(lines) or "🟢 Отключений нет"
@@ -122,7 +125,6 @@ def parse_schedules(fact: dict) -> dict:
         result[int(ts)] = {
             "date": datetime.fromtimestamp(int(ts), TZ).date(),
             "slots": slots,
-            "text": slots_to_text(slots),
             "sig": "".join(slots),
         }
     return dict(sorted(result.items()))
@@ -148,7 +150,7 @@ async def start_browser():
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--no-zygote",
-            "--single-process",  # Экономия памяти на слабых VPS/Render
+            "--single-process",
             "--disable-extensions",
             "--disable-accelerated-2d-canvas",
             "--disable-blink-features=AutomationControlled",
@@ -186,7 +188,7 @@ async def _load_html() -> str:
         )
         return await page.content()
     finally:
-        await page.close() # Жестко закрываем страницу, чтобы не текла память
+        await page.close()
 
 
 async def fetch_fact():
@@ -242,8 +244,11 @@ def format_time(h, m):
     return f"{h}ч {m} мин"
 
 
-def calculate_time_left(schedules: dict) -> str:
+def calculate_time_left(schedules: dict, user_id=None) -> str:
     now = now_kyiv()
+    if user_id and int(user_id) in OFFSET_USERS:
+        now += timedelta(hours=1)
+
     by_date = {d["date"]: d for d in schedules.values()}
 
     today = by_date.get(now.date())
@@ -280,8 +285,12 @@ def calculate_time_left(schedules: dict) -> str:
     return res
 
 
-def render_message(snap: dict, header: str) -> str:
+def render_message(snap: dict, header: str, user_id=None) -> str:
     now = now_kyiv()
+    offset = 1 if (user_id and int(user_id) in OFFSET_USERS) else 0
+    if offset:
+        now += timedelta(hours=1)
+
     by_date = {d["date"]: d for d in snap["schedules"].values()}
     today_date = now.date()
     tomorrow_date = today_date + timedelta(days=1)
@@ -292,12 +301,14 @@ def render_message(snap: dict, header: str) -> str:
     blocks = []
     
     if today:
-        blocks.append(f"⚡{day_title(today['date'], now)}⚡\n{today['text']}")
+        text = slots_to_text(today['slots'], hour_offset=offset)
+        blocks.append(f"⚡{day_title(today['date'], now)}⚡\n{text}")
     else:
         blocks.append(f"⚡на сегодня {today_date.strftime('%d.%m.%Y')}⚡\n⚠️ График на сегодня отсутствует")
 
     if tomorrow:
-        blocks.append(f"⚡{day_title(tomorrow['date'], now)}⚡\n{tomorrow['text']}")
+        text = slots_to_text(tomorrow['slots'], hour_offset=offset)
+        blocks.append(f"⚡{day_title(tomorrow['date'], now)}⚡\n{text}")
     else:
         blocks.append(f"⚡на завтра {tomorrow_date.strftime('%d.%m.%Y')}⚡\n⚠️ График на завтра отсутствует, нужно подождать пока появится")
 
@@ -306,7 +317,7 @@ def render_message(snap: dict, header: str) -> str:
     return (
         f"{header}\n"
         f"<pre>{blocks_str}</pre>\n"
-        f"{calculate_time_left(snap['schedules'])}"
+        f"{calculate_time_left(snap['schedules'], user_id=user_id)}"
         f"<pre>🕒 Обновлено: {html.escape(snap['updated'])}</pre>"
     )
 
@@ -342,7 +353,6 @@ async def monitoring_task():
                     key = f"sched2:{GROUP}:{ts}"
                     old = _s(await rcall(redis_client.get, key))
                     
-                    # Если ключа не было РЕАЛЬНО (например, появился завтрашний день) ИЛИ старый график отличается
                     if old is None:
                         changed = True
                     elif old != d["sig"]:
@@ -352,14 +362,15 @@ async def monitoring_task():
 
                 if changed:
                     logging.info("📢 Schedule changed or new day added, notifying users")
-                    msg = render_message(snap, "🔔 <b>ГРАФИК ИЗМЕНИЛСЯ</b>")
                     builder = InlineKeyboardBuilder()
                     builder.row(types.InlineKeyboardButton(
                         text="🔹 Информация на сегодня", callback_data="show_att"))
 
                     for uid in users:
                         try:
-                            await bot.send_message(int(_s(uid)), msg,
+                            uid_int = int(_s(uid))
+                            msg = render_message(snap, "🔔 <b>ГРАФИК ИЗМЕНИЛСЯ</b>", user_id=uid_int)
+                            await bot.send_message(uid_int, msg,
                                                    reply_markup=builder.as_markup(),
                                                    parse_mode="HTML")
                             await asyncio.sleep(0.05)
@@ -390,7 +401,7 @@ async def manual(m: types.Message):
             await m.answer("❌ <b>Ошибка:</b> график временно недоступен, попробуйте через минуту.", parse_mode="HTML")
             return
 
-    await m.answer(render_message(snap, "💡<b>ГРАФИК ОТКЛЮЧЕНИЙ</b>"),
+    await m.answer(render_message(snap, "💡<b>ГРАФИК ОТКЛЮЧЕНИЙ</b>", user_id=m.from_user.id),
                    reply_markup=builder.as_markup(), parse_mode="HTML")
 
 
