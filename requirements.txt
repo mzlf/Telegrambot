@@ -3,3 +3,4 @@ playwright
 pytz
 upstash-redis
 redis
+python-dotenv
