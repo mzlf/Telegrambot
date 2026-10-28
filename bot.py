@@ -16,25 +16,44 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
+# Загружаем переменные окружения из локального файла .env (если он есть)
+load_dotenv()
+
 # ============================= CONFIG =============================
-TOKEN = "8699245998:AAFrajfnUyi7lVNdPvzrykAz6KjWcgAtXHw"
+TOKEN = os.getenv("BOT_TOKEN")
 
-REDIS_HOST = "wrench-microstrong-back-61275.db.redis.io"
-REDIS_PORT = 17778
-REDIS_PASSWORD = "ZZjNkOsY6RK6iojvs721XY8sYB8c4fHM"
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 17778))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 
-GROUP = "GPV4.1"
+GROUP = os.getenv("GROUP", "GPV4.1")
 SITE_URL = "https://www.dtek-krem.com.ua/ua/shutdowns"
 HEADLESS = os.getenv("HEADLESS", "1") == "1"
-CHECK_INTERVAL = 300
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))
 CACHE_TTL = 90
 DEFAULT_ATTENTION = "Актуальных повідомлень немає."
 TZ = pytz.timezone("Europe/Kiev")
 
-# Только для этого юзера сдвиг отображения графика на +1 час
-OFFSET_USERS = {1437149670}
+# Сдвиги времени для пользователей (можно задать через ENV в формате ID:сдвиг,ID:сдвиг)
+# Пример в .env: OFFSET_USERS="1437149670:1,6072460838:-3"
+OFFSET_USERS = {}
+env_offsets = os.getenv("OFFSET_USERS")
+if env_offsets:
+    try:
+        for pair in env_offsets.split(","):
+            uid_str, offset_str = pair.split(":")
+            OFFSET_USERS[int(uid_str.strip())] = int(offset_str.strip())
+    except Exception as e:
+        logging.error("Failed to parse OFFSET_USERS from env: %s", e)
+else:
+    # Дефолтные значения на случай, если в ENV ничего не передано
+    OFFSET_USERS = {
+        1437149670: 1,   # Первый пользователь (+1 час)
+        6072460838: -3   # Второй пользователь (-3 часа)
+    }
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -102,7 +121,8 @@ def day_to_slots(day: dict) -> list:
 
 def slots_to_text(slots: list, hour_offset: int = 0) -> str:
     def fmt(i):
-        m = (i + hour_offset * 2) * 30
+        slot_index = (i + hour_offset * 2) % 48
+        m = slot_index * 30
         return f"{(m // 60) % 24:02d}:{m % 60:02d}"
 
     lines, start = [], 0
@@ -245,7 +265,6 @@ def format_time(h, m):
 
 
 def calculate_time_left(schedules: dict) -> str:
-    # Всегда считаем по реальному текущему времени без всяких сдвигов
     now = now_kyiv()
     by_date = {d["date"]: d for d in schedules.values()}
 
@@ -285,8 +304,7 @@ def calculate_time_left(schedules: dict) -> str:
 
 def render_message(snap: dict, header: str, user_id=None) -> str:
     now = now_kyiv()
-    # Сдвиг по времени применяется ТОЛЬКО для отображения текста графика у нужного юзера
-    offset = 1 if (user_id and int(user_id) in OFFSET_USERS) else 0
+    offset = OFFSET_USERS.get(int(user_id), 0) if user_id else 0
     display_now = now + timedelta(hours=offset)
 
     by_date = {d["date"]: d for d in snap["schedules"].values()}
@@ -315,7 +333,7 @@ def render_message(snap: dict, header: str, user_id=None) -> str:
     return (
         f"{header}\n"
         f"<pre>{blocks_str}</pre>\n"
-        f"{calculate_time_left(snap['schedules'])}" # Таймер считает по реальному времени без сдвигов
+        f"{calculate_time_left(snap['schedules'])}"
         f"<pre>🕒 Обновлено: {html.escape(snap['updated'])}</pre>"
     )
 
@@ -416,7 +434,7 @@ async def callback_att(call: types.CallbackQuery):
 @dp.message(F.text.contains("мониторинг") | F.text.contains("Мониторинг") | F.text.contains("🔔"))
 async def toggle(m: types.Message):
     uid = str(m.from_user.id)
-    if await rcall(redis_client.sismember, "monitoring_users", uid):
+.    if await rcall(redis_client.sismember, "monitoring_users", uid):
         await rcall(redis_client.srem, "monitoring_users", uid)
         await m.answer("Мониторинг выключен.")
     else:
