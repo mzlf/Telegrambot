@@ -19,7 +19,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
-# Загружаем переменные окружения из локального файла .env (если он есть)
 load_dotenv()
 
 # ============================= CONFIG =============================
@@ -37,8 +36,6 @@ CACHE_TTL = 90
 DEFAULT_ATTENTION = "Актуальных повідомлень немає."
 TZ = pytz.timezone("Europe/Kiev")
 
-# Сдвиги времени для пользователей (можно задать через ENV в формате ID:сдвиг,ID:сдвиг)
-# Пример в .env: OFFSET_USERS="1437149670:1,6072460838:-3"
 OFFSET_USERS = {}
 env_offsets = os.getenv("OFFSET_USERS")
 if env_offsets:
@@ -49,7 +46,6 @@ if env_offsets:
     except Exception as e:
         logging.error("Failed to parse OFFSET_USERS from env: %s", e)
 else:
-    # Дефолтные значения на случай, если в ENV ничего не передано
     OFFSET_USERS = {
         1437149670: 1,   # Первый пользователь (+1 час)
         6072460838: -3   # Второй пользователь (-3 часа)
@@ -434,7 +430,7 @@ async def callback_att(call: types.CallbackQuery):
 @dp.message(F.text.contains("мониторинг") | F.text.contains("Мониторинг") | F.text.contains("🔔"))
 async def toggle(m: types.Message):
     uid = str(m.from_user.id)
-.    if await rcall(redis_client.sismember, "monitoring_users", uid):
+    if await rcall(redis_client.sismember, "monitoring_users", uid):
         await rcall(redis_client.srem, "monitoring_users", uid)
         await m.answer("Мониторинг выключен.")
     else:
