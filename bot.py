@@ -33,8 +33,8 @@ CACHE_TTL = 90
 DEFAULT_ATTENTION = "Актуальных повідомлень немає."
 TZ = pytz.timezone("Europe/Kiev")
 
-# Юзеры со смещением времени на +1 час
-OFFSET_USERS = {1437149670, 1016062199}
+# Только для этого юзера сдвиг отображения графика на +1 час
+OFFSET_USERS = {1437149670}
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -244,11 +244,9 @@ def format_time(h, m):
     return f"{h}ч {m} мин"
 
 
-def calculate_time_left(schedules: dict, user_id=None) -> str:
+def calculate_time_left(schedules: dict) -> str:
+    # Всегда считаем по реальному текущему времени без всяких сдвигов
     now = now_kyiv()
-    if user_id and int(user_id) in OFFSET_USERS:
-        now += timedelta(hours=1)
-
     by_date = {d["date"]: d for d in schedules.values()}
 
     today = by_date.get(now.date())
@@ -287,12 +285,12 @@ def calculate_time_left(schedules: dict, user_id=None) -> str:
 
 def render_message(snap: dict, header: str, user_id=None) -> str:
     now = now_kyiv()
+    # Сдвиг по времени применяется ТОЛЬКО для отображения текста графика у нужного юзера
     offset = 1 if (user_id and int(user_id) in OFFSET_USERS) else 0
-    if offset:
-        now += timedelta(hours=1)
+    display_now = now + timedelta(hours=offset)
 
     by_date = {d["date"]: d for d in snap["schedules"].values()}
-    today_date = now.date()
+    today_date = display_now.date()
     tomorrow_date = today_date + timedelta(days=1)
 
     today = by_date.get(today_date)
@@ -302,13 +300,13 @@ def render_message(snap: dict, header: str, user_id=None) -> str:
     
     if today:
         text = slots_to_text(today['slots'], hour_offset=offset)
-        blocks.append(f"⚡{day_title(today['date'], now)}⚡\n{text}")
+        blocks.append(f"⚡{day_title(today['date'], display_now)}⚡\n{text}")
     else:
         blocks.append(f"⚡на сегодня {today_date.strftime('%d.%m.%Y')}⚡\n⚠️ График на сегодня отсутствует")
 
     if tomorrow:
         text = slots_to_text(tomorrow['slots'], hour_offset=offset)
-        blocks.append(f"⚡{day_title(tomorrow['date'], now)}⚡\n{text}")
+        blocks.append(f"⚡{day_title(tomorrow['date'], display_now)}⚡\n{text}")
     else:
         blocks.append(f"⚡на завтра {tomorrow_date.strftime('%d.%m.%Y')}⚡\n⚠️ График на завтра отсутствует, нужно подождать пока появится")
 
@@ -317,7 +315,7 @@ def render_message(snap: dict, header: str, user_id=None) -> str:
     return (
         f"{header}\n"
         f"<pre>{blocks_str}</pre>\n"
-        f"{calculate_time_left(snap['schedules'], user_id=user_id)}"
+        f"{calculate_time_left(snap['schedules'])}" # Таймер считает по реальному времени без сдвигов
         f"<pre>🕒 Обновлено: {html.escape(snap['updated'])}</pre>"
     )
 
