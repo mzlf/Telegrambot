@@ -4,3 +4,4 @@ pytz
 upstash-redis
 redis
 python-dotenv
+dtek-blackout-client
