@@ -43,11 +43,7 @@ if env_offsets:
             OFFSET_USERS[int(uid_str.strip())] = int(offset_str.strip())
     except Exception as e:
         logging.error("Failed to parse OFFSET_USERS from env: %s", e)
-else:
-    OFFSET_USERS = {
-        1437149670: 1,
-        6072460838: -3
-    }
+
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
