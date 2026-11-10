@@ -1,12 +1,10 @@
 """
-DTEK Kyiv-region outage bot - Optimized, Anti-Bot, Web-Server for UptimeRobot.
+DTEK Kyiv-region outage bot - Using dtek-blackout-client for reliable schedule fetching.
 """
 import asyncio
 import html
-import json
 import logging
 import os
-import re
 import time
 from datetime import datetime, timedelta
 
@@ -17,7 +15,10 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+
+# The key library that replaces manual scraping
+from dtek_client import DtekClient
+from dtek_client.enums import SlotStatus  # For mapping status to emoji
 
 load_dotenv()
 
@@ -29,13 +30,13 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", 17778))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 
 GROUP = os.getenv("GROUP", "GPV4.1")
-SITE_URL = "https://www.dtek-krem.com.ua/ua/shutdowns"
-HEADLESS = os.getenv("HEADLESS", "1") == "1"
+REGION = "krem"  # 'krem' = DTEK Kyiv Regional Networks (smaller towns)
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))
 CACHE_TTL = 90
-DEFAULT_ATTENTION = "Актуальных повідомлень немає."
+DEFAULT_ATTENTION = "Актуальних повідомлень немає."
 TZ = pytz.timezone("Europe/Kiev")
 
+# Offset users (unchanged)
 OFFSET_USERS = {}
 env_offsets = os.getenv("OFFSET_USERS")
 if env_offsets:
@@ -47,8 +48,8 @@ if env_offsets:
         logging.error("Failed to parse OFFSET_USERS from env: %s", e)
 else:
     OFFSET_USERS = {
-        1437149670: 1,   # Первый пользователь (+1 час)
-        6072460838: -3   # Второй пользователь (-3 часа)
+        1437149670: 1,
+        6072460838: -3
     }
 
 bot = Bot(token=TOKEN)
@@ -64,205 +65,133 @@ redis_client = redis.Redis(
 
 logging.basicConfig(level=logging.INFO)
 
-# browser state
-playwright = None
-browser = None
-context = None
-fetch_lock = asyncio.Lock()
+# Cache for snapshots (now holds data from the library)
 _cache = {"ts": 0.0, "snap": None}
+fetch_lock = asyncio.Lock()
+
+# A single DtekClient instance can be reused. It will manage its own Playwright browser for WAF bypass.
+dtek_client: DtekClient | None = None
+
+
+async def get_dtek_client() -> DtekClient:
+    """Lazily initializes and returns the DtekClient."""
+    global dtek_client
+    if dtek_client is None:
+        # The client will handle WAF bypass internally using Playwright.
+        dtek_client = DtekClient(REGION)
+    return dtek_client
 
 
 def now_kyiv():
     return datetime.now(TZ)
 
 
-def _s(x):
-    return x.decode() if isinstance(x, bytes) else x
-
-
 async def rcall(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
-# ============================= PARSING =============================
-def extract_fact_from_html(page_html: str):
-    m = re.search(r"DisconSchedule\.fact\s*=\s*", page_html)
-    if not m:
-        return None
+# ============================= SCHEDULE FETCHING (LIBRARY-BASED) =============================
+async def fetch_schedules_from_library() -> dict:
+    """
+    Fetches today's and tomorrow's confirmed schedules for the configured group
+    using the dtek-blackout-client library.
+    """
+    client = await get_dtek_client()
+
+    # We need to find an address that belongs to the target group.
+    # The library allows searching by address. For a group-based bot,
+    # we need a representative address. A common approach is to use the
+    # city/street/house that you know belongs to GPV4.1 in your region.
+    # **IMPORTANT**: You must replace these with a real address from your area
+    # that is assigned to GROUP (GPV4.1). The library's stub client can help you
+    # test with a known address (e.g., "м. Українка", "вул. Юності", "1").
+    # For production, use an address that actually maps to your group.
+    # You can use `client.get_streets` and `client.get_home_num` to discover
+    # the correct group_id for an address.
+
+    # Example using an address known to be in GPV4.1 from the library's stub data.
+    # **You must verify this address is correct for your specific region and group.**
+    city = "м. Українка"
+    street = "вул. Юності"
+    house_number = "1"
+
     try:
-        obj, _ = json.JSONDecoder().raw_decode(page_html[m.end():])
-        return obj
-    except ValueError:
-        return None
-
-
-def extract_attention_from_html(page_html: str) -> str:
-    m = re.search(r'class="[^"]*m-attention__text[^"]*"[^>]*>(.*?)</div>', page_html, re.S)
-    if not m:
-        return DEFAULT_ATTENTION
-    text = html.unescape(re.sub(r"<[^>]+>", "", m.group(1)))
-    text = re.sub(r"\s+", " ", text).strip()
-    text = re.sub(r"\s+([.,!?;:])", r"\1", text)
-    return text or DEFAULT_ATTENTION
-
-
-def day_to_slots(day: dict) -> list:
-    slots = []
-    for h in range(1, 25):
-        v = day.get(str(h), "yes")
-        slots.append("🔴" if v in ("no", "first") else "🟢")
-        slots.append("🔴" if v in ("no", "second") else "🟢")
-    return slots
-
-
-def slots_to_text(slots: list, hour_offset: int = 0) -> str:
-    def fmt(i):
-        slot_index = (i + hour_offset * 2) % 48
-        m = slot_index * 30
-        return f"{(m // 60) % 24:02d}:{m % 60:02d}"
-
-    lines, start = [], 0
-    for i in range(1, 49):
-        if i == 48 or slots[i] != slots[start]:
-            if slots[start] == "🔴":
-                end = fmt(48) if i == 48 else fmt(i)
-                lines.append(f"🔴{fmt(start)} — {end}🔴")
-            start = i
-    return "\n".join(lines) or "🟢 Отключений нет"
-
-
-def parse_schedules(fact: dict) -> dict:
-    result = {}
-    for ts, groups in (fact.get("data") or {}).items():
-        day = groups.get(GROUP)
-        if not day:
-            continue
-        slots = day_to_slots(day)
-        result[int(ts)] = {
-            "date": datetime.fromtimestamp(int(ts), TZ).date(),
-            "slots": slots,
-            "sig": "".join(slots),
-        }
-    return dict(sorted(result.items()))
-
-
-def day_title(d, now) -> str:
-    delta = (d - now.date()).days
-    label = {0: "на сегодня", 1: "на завтра"}.get(delta, "на")
-    return f"{label} {d.strftime('%d.%m.%Y')}"
-
-
-# ============================= BROWSER (RAM OPTIMIZED) =============================
-async def start_browser():
-    global playwright, browser, context
-    if browser:
-        return
-    playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch(
-        headless=HEADLESS,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--no-zygote",
-            "--single-process",
-            "--disable-extensions",
-            "--disable-accelerated-2d-canvas",
-            "--disable-blink-features=AutomationControlled",
-        ]
-    )
-    context = await browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        viewport={"width": 1280, "height": 720},
-        device_scale_factor=1,
-    )
-
-
-async def stop_browser():
-    global playwright, browser, context
-    try:
-        if context:
-            await context.close()
-        if browser:
-            await browser.close()
-        if playwright:
-            await playwright.stop()
-    except Exception:
-        pass
-    playwright = browser = context = None
-
-
-async def _load_html() -> str:
-    page = await context.new_page()
-    try:
-        await page.set_extra_http_headers({
-            "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-        })
-        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        
-        # Переходим на страницу с мягким ожиданием
-        await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=35000)
-        
-        # Безопасное ожидание данных без жесткого падения по тайм-ауту скрипта
-        for _ in range(15):
-            content = await page.content()
-            if "DisconSchedule" in content and "fact" in content:
-                return content
-            await asyncio.sleep(2)
-            
-        return await page.content()
-    finally:
-        await page.close()
-
-
-async def fetch_fact():
-    await start_browser()
-    try:
-        text = await _load_html()
-        fact = extract_fact_from_html(text)
-        if fact and "data" in fact:
-            return fact, extract_attention_from_html(text)
-        raise RuntimeError("DisconSchedule.fact not found in page content")
+        today_slots = await client.get_today_schedule(city, street, house_number)
+        tomorrow_slots = await client.get_tomorrow_schedule(city, street, house_number)
     except Exception as e:
-        logging.error("Fetch failed: %s", e)
-        await stop_browser()
-        raise e
+        logging.error(f"Failed to fetch schedules from library: {e}")
+        raise
 
+    now = now_kyiv()
+    today_date = now.date()
+    tomorrow_date = today_date + timedelta(days=1)
 
-def _cache_fresh() -> bool:
-    return bool(_cache["snap"]) and time.monotonic() - _cache["ts"] < CACHE_TTL
+    # Convert the library's SlotStatus dict into the format our bot uses.
+    def slots_to_internal(slot_dict: dict[str, SlotStatus]) -> dict:
+        """Converts a dict of time->SlotStatus into a list of emojis and a signature string."""
+        # The dict keys are times like "00:00", "00:30", etc.
+        # We sort them to ensure correct order.
+        sorted_times = sorted(slot_dict.keys())
+        emojis = []
+        for t in sorted_times:
+            status = slot_dict[t]
+            # Use the .has_outage property to decide: True = outage (red), False = power (green)
+            emojis.append("🔴" if status.has_outage else "🟢")
+
+        return {
+            "date": None,  # Will be set outside
+            "slots": emojis,
+            "sig": "".join(emojis),
+        }
+
+    schedules = {}
+
+    if today_slots:
+        internal = slots_to_internal(today_slots)
+        internal["date"] = today_date
+        schedules[int(today_date.strftime("%s"))] = internal
+
+    if tomorrow_slots:
+        internal = slots_to_internal(tomorrow_slots)
+        internal["date"] = tomorrow_date
+        schedules[int(tomorrow_date.strftime("%s"))] = internal
+
+    return schedules
 
 
 async def get_snapshot(force=False):
     async with fetch_lock:
-        if not force and _cache_fresh():
+        if not force and _cache["snap"] and (time.monotonic() - _cache["ts"] < CACHE_TTL):
             return _cache["snap"]
 
         try:
-            fact, attention = await fetch_fact()
-            schedules = parse_schedules(fact)
+            schedules = await fetch_schedules_from_library()
+
             if not schedules:
-                raise RuntimeError(f"Group {GROUP} not found in fact data")
+                raise RuntimeError(f"Group {GROUP} not found in fetched schedules.")
+
+            # The library does not provide the "attention" text.
+            # We will use a default or you can implement a separate lightweight scraper
+            # for the attention banner if it is critical.
+            attention = DEFAULT_ATTENTION
 
             snap = {
                 "schedules": schedules,
-                "updated": fact.get("update", "---"),
+                "updated": now_kyiv().strftime("%Y-%m-%d %H:%M:%S"),
                 "attention": attention,
             }
             _cache["ts"] = time.monotonic()
             _cache["snap"] = snap
             return snap
         except Exception as e:
-            # Если свежий запрос упал, но в кеше что-то есть — отдаем старое, чтобы не ломать бота
+            # If a fresh fetch fails but we have a cached snapshot, return the cached one.
             if _cache["snap"]:
-                logging.warning("⚠️ Не удалось получить свежие данные, используем кеш: %s", e)
+                logging.warning("⚠️ Failed to fetch fresh data, using cache: %s", e)
                 return _cache["snap"]
             raise e
 
 
-# ============================= TIME CALC =============================
+# ============================= TIME CALC & RENDERING (ADAPTED) =============================
 def h_str(h):
     return str(int(h)) if h % 1 == 0 else str(h)
 
@@ -315,6 +244,28 @@ def calculate_time_left(schedules: dict) -> str:
     return res
 
 
+def slots_to_text(slots: list, hour_offset: int = 0) -> str:
+    def fmt(i):
+        slot_index = (i + hour_offset * 2) % 48
+        m = slot_index * 30
+        return f"{(m // 60) % 24:02d}:{m % 60:02d}"
+
+    lines, start = [], 0
+    for i in range(1, 49):
+        if i == 48 or slots[i] != slots[start]:
+            if slots[start] == "🔴":
+                end = fmt(48) if i == 48 else fmt(i)
+                lines.append(f"🔴{fmt(start)} — {end}🔴")
+            start = i
+    return "\n".join(lines) or "🟢 Отключений нет"
+
+
+def day_title(d, now) -> str:
+    delta = (d - now.date()).days
+    label = {0: "на сегодня", 1: "на завтра"}.get(delta, "на")
+    return f"{label} {d.strftime('%d.%m.%Y')}"
+
+
 def render_message(snap: dict, header: str, user_id=None) -> str:
     now = now_kyiv()
     offset = OFFSET_USERS.get(int(user_id), 0) if user_id else 0
@@ -328,7 +279,7 @@ def render_message(snap: dict, header: str, user_id=None) -> str:
     tomorrow = by_date.get(tomorrow_date)
 
     blocks = []
-    
+
     if today:
         text = slots_to_text(today['slots'], hour_offset=offset)
         blocks.append(f"⚡{day_title(today['date'], display_now)}⚡\n{text}")
@@ -380,13 +331,11 @@ async def monitoring_task():
                 changed = False
                 for ts, d in snap["schedules"].items():
                     key = f"sched2:{GROUP}:{ts}"
-                    old = _s(await rcall(redis_client.get, key))
-                    
-                    if old is None:
+                    old = await rcall(redis_client.get, key)
+
+                    if old is None or old != d["sig"]:
                         changed = True
-                    elif old != d["sig"]:
-                        changed = True
-                        
+
                     await rcall(redis_client.set, key, d["sig"], ex=172800)
 
                 if changed:
@@ -397,7 +346,7 @@ async def monitoring_task():
 
                     for uid in users:
                         try:
-                            uid_int = int(_s(uid))
+                            uid_int = int(uid)
                             msg = render_message(snap, "🔔 <b>ГРАФИК ИЗМЕНИЛСЯ</b>", user_id=uid_int)
                             await bot.send_message(uid_int, msg,
                                                    reply_markup=builder.as_markup(),
@@ -406,7 +355,7 @@ async def monitoring_task():
                         except Exception as e:
                             logging.error("Broadcast to %s failed: %s", uid, e)
         except Exception as e:
-            logging.warning("⚠️ Monitoring skipped due to network/site lag: %s", e)
+            logging.warning("⚠️ Monitoring skipped due to error: %s", e)
         await asyncio.sleep(CHECK_INTERVAL)
 
 
@@ -470,7 +419,7 @@ async def start_web_server():
     app.router.add_get("/health", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    
+
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
@@ -488,7 +437,7 @@ async def warm_up():
 
 async def main():
     background = [
-        asyncio.create_task(warm_up()), 
+        asyncio.create_task(warm_up()),
         asyncio.create_task(monitoring_task()),
         asyncio.create_task(start_web_server())
     ]
@@ -497,7 +446,7 @@ async def main():
     finally:
         for t in background:
             t.cancel()
-        await stop_browser()
+        # The DtekClient manages its own resources; we don't need to stop a global browser here.
 
 
 if __name__ == "__main__":
