@@ -196,12 +196,22 @@ async def stop_browser():
 async def _load_html() -> str:
     page = await context.new_page()
     try:
+        await page.set_extra_http_headers({
+            "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        })
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_function(
-            "() => typeof DisconSchedule !== 'undefined' && !!DisconSchedule.fact",
-            timeout=20000,
-        )
+        
+        # Переходим на страницу с мягким ожиданием
+        await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=35000)
+        
+        # Безопасное ожидание данных без жесткого падения по тайм-ауту скрипта
+        for _ in range(15):
+            content = await page.content()
+            if "DisconSchedule" in content and "fact" in content:
+                return content
+            await asyncio.sleep(2)
+            
         return await page.content()
     finally:
         await page.close()
@@ -230,19 +240,26 @@ async def get_snapshot(force=False):
         if not force and _cache_fresh():
             return _cache["snap"]
 
-        fact, attention = await fetch_fact()
-        schedules = parse_schedules(fact)
-        if not schedules:
-            raise RuntimeError(f"Group {GROUP} not found in fact data")
+        try:
+            fact, attention = await fetch_fact()
+            schedules = parse_schedules(fact)
+            if not schedules:
+                raise RuntimeError(f"Group {GROUP} not found in fact data")
 
-        snap = {
-            "schedules": schedules,
-            "updated": fact.get("update", "---"),
-            "attention": attention,
-        }
-        _cache["ts"] = time.monotonic()
-        _cache["snap"] = snap
-        return snap
+            snap = {
+                "schedules": schedules,
+                "updated": fact.get("update", "---"),
+                "attention": attention,
+            }
+            _cache["ts"] = time.monotonic()
+            _cache["snap"] = snap
+            return snap
+        except Exception as e:
+            # Если свежий запрос упал, но в кеше что-то есть — отдаем старое, чтобы не ломать бота
+            if _cache["snap"]:
+                logging.warning("⚠️ Не удалось получить свежие данные, используем кеш: %s", e)
+                return _cache["snap"]
+            raise e
 
 
 # ============================= TIME CALC =============================
