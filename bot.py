@@ -128,7 +128,8 @@ async def fetch_fact_from_mirror() -> dict:
         async with session.get(DATA_URL, timeout=20, headers=headers) as resp:
             logging.info("Mirror HTTP status: %s", resp.status)
             resp.raise_for_status()
-            data = await resp.json()
+            # GitHub raw отдаёт JSON с Content-Type: text/plain — отключаем проверку mimetype
+            data = await resp.json(content_type=None)
             fact = data.get("fact")
             if not fact or "data" not in fact:
                 raise RuntimeError("Invalid 'fact' structure in mirror JSON.")
