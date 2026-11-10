@@ -1,5 +1,5 @@
 """
-DTEK Kyiv-region outage bot - Using a reliable public JSON mirror.
+DTEK Kyiv-region outage bot - Reliable JSON mirror version.
 """
 import asyncio
 import html
@@ -26,9 +26,12 @@ REDIS_HOST = os.getenv("REDIS_HOST")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 17778))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 
+# Group name must match exactly what is in the JSON (e.g., "GPV4.1")
 GROUP = os.getenv("GROUP", "GPV4.1")
-# This is the stable mirror URL for Kyiv region data
+
+# Verified working URL for Kyiv Regional Network data
 DATA_URL = "https://raw.githubusercontent.com/Baskerville42/outage-data-ua/main/data/kyiv-region.json"
+
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))
 CACHE_TTL = 90
 DEFAULT_ATTENTION = "Актуальних повідомлень немає."
@@ -43,7 +46,11 @@ if env_offsets:
             OFFSET_USERS[int(uid_str.strip())] = int(offset_str.strip())
     except Exception as e:
         logging.error("Failed to parse OFFSET_USERS from env: %s", e)
-
+else:
+    OFFSET_USERS = {
+        1437149670: 1,
+        6072460838: -3
+    }
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -56,7 +63,7 @@ redis_client = redis.Redis(
     password=REDIS_PASSWORD,
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # Cache
 fetch_lock = asyncio.Lock()
@@ -81,17 +88,22 @@ def day_to_slots(day: dict) -> list:
     slots = []
     for h in range(1, 25):
         v = day.get(str(h), "yes")
-        slots.append("🔴" if v in ("no", "first") else "🟢")
-        slots.append("🔴" if v in ("no", "second") else "🟢")
+        # "no", "first", and "second" all mean the power is OFF (red)
+        slots.append("🔴" if v in ("no", "first", "second") else "🟢")
+        slots.append("🔴" if v in ("no", "first", "second") else "🟢")
     return slots
 
 
 def parse_schedules_from_fact(fact: dict) -> dict:
     """Parses the 'fact' object from the mirror JSON."""
     result = {}
-    for ts, groups in (fact.get("data") or {}).items():
+    data_block = fact.get("data") or {}
+    for ts, groups in data_block.items():
         day = groups.get(GROUP)
         if not day:
+            # Log which groups are available once, to help debug if GROUP is wrong
+            if not result:
+                logging.debug("Available groups in first timestamp: %s", list(groups.keys())[:5])
             continue
         slots = day_to_slots(day)
         result[int(ts)] = {
@@ -111,8 +123,10 @@ def day_title(d, now) -> str:
 # ============================= FETCHING & CACHE =============================
 async def fetch_fact_from_mirror() -> dict:
     """Fetches the entire JSON blob from the public GitHub mirror."""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; OutageBot/1.0)"}
     async with aiohttp.ClientSession() as session:
-        async with session.get(DATA_URL, timeout=20) as resp:
+        async with session.get(DATA_URL, timeout=20, headers=headers) as resp:
+            logging.info("Mirror HTTP status: %s", resp.status)
             resp.raise_for_status()
             data = await resp.json()
             fact = data.get("fact")
@@ -131,20 +145,22 @@ async def get_snapshot(force=False):
             schedules = parse_schedules_from_fact(fact)
 
             if not schedules:
-                raise RuntimeError(f"Group {GROUP} not found in mirror data.")
+                raise RuntimeError(f"Group {GROUP} not found in mirror data. Check your GROUP env variable.")
 
             snap = {
                 "schedules": schedules,
                 "updated": fact.get("updateFact", "---"),
-                "attention": DEFAULT_ATTENTION,  # Mirror does not include attention text
+                "attention": DEFAULT_ATTENTION,
             }
             _cache["ts"] = time.monotonic()
             _cache["snap"] = snap
+            logging.info("✅ Snapshot updated. Group %s has %d days of data.", GROUP, len(schedules))
             return snap
         except Exception as e:
             if _cache["snap"]:
-                logging.warning("⚠️ Mirror fetch failed, using cache: %s", e)
+                logging.warning("⚠️ Mirror fetch failed, using cached snapshot: %s", e)
                 return _cache["snap"]
+            # Re-raise so the caller (manual handler) can log and notify the user
             raise e
 
 
@@ -306,7 +322,7 @@ async def monitoring_task():
                         except Exception as e:
                             logging.error("Broadcast to %s failed: %s", uid, e)
         except Exception as e:
-            logging.warning("⚠️ Monitoring skipped due to error: %s", e)
+            logging.warning("⚠️ Monitoring loop error (will retry): %s", e)
         await asyncio.sleep(CHECK_INTERVAL)
 
 
@@ -326,8 +342,10 @@ async def manual(m: types.Message):
     if not snap:
         try:
             snap = await get_snapshot()
-        except Exception:
-            await m.answer("❌ <b>Ошибка:</b> график временно недоступен, попробуйте через минуту.", parse_mode="HTML")
+        except Exception as e:
+            # CRITICAL: Log the real error so you can see it in the console
+            logging.exception("Manual schedule fetch failed for user %s", m.from_user.id)
+            await m.answer("❌ <b>Ошибка:</b> график временно недоступен. Проверьте логи бота для деталей.", parse_mode="HTML")
             return
 
     await m.answer(render_message(snap, "💡<b>ГРАФИК ОТКЛЮЧЕНИЙ</b>", user_id=m.from_user.id),
