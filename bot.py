@@ -1,5 +1,5 @@
 """
-DTEK Kyiv-region outage bot - Using dtek-blackout-client for reliable schedule fetching.
+DTEK Kyiv-region outage bot - Using a reliable public JSON mirror.
 """
 import asyncio
 import html
@@ -8,6 +8,7 @@ import os
 import time
 from datetime import datetime, timedelta
 
+import aiohttp
 import pytz
 import redis
 from aiohttp import web
@@ -15,10 +16,6 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
-
-# The key library that replaces manual scraping
-from dtek_client import DtekClient
-from dtek_client.enums import SlotStatus  # For mapping status to emoji
 
 load_dotenv()
 
@@ -30,13 +27,13 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", 17778))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 
 GROUP = os.getenv("GROUP", "GPV4.1")
-REGION = "krem"  # 'krem' = DTEK Kyiv Regional Networks (smaller towns)
+# This is the stable mirror URL for Kyiv region data
+DATA_URL = "https://raw.githubusercontent.com/Baskerville42/outage-data-ua/main/data/kyiv-region.json"
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))
 CACHE_TTL = 90
 DEFAULT_ATTENTION = "Актуальних повідомлень немає."
 TZ = pytz.timezone("Europe/Kiev")
 
-# Offset users (unchanged)
 OFFSET_USERS = {}
 env_offsets = os.getenv("OFFSET_USERS")
 if env_offsets:
@@ -65,98 +62,67 @@ redis_client = redis.Redis(
 
 logging.basicConfig(level=logging.INFO)
 
-# Cache for snapshots (now holds data from the library)
-_cache = {"ts": 0.0, "snap": None}
+# Cache
 fetch_lock = asyncio.Lock()
-
-# A single DtekClient instance can be reused. It will manage its own Playwright browser for WAF bypass.
-dtek_client: DtekClient | None = None
-
-
-async def get_dtek_client() -> DtekClient:
-    """Lazily initializes and returns the DtekClient."""
-    global dtek_client
-    if dtek_client is None:
-        # The client will handle WAF bypass internally using Playwright.
-        dtek_client = DtekClient(REGION)
-    return dtek_client
+_cache = {"ts": 0.0, "snap": None}
 
 
 def now_kyiv():
     return datetime.now(TZ)
 
 
+def _s(x):
+    return x.decode() if isinstance(x, bytes) else x
+
+
 async def rcall(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
-# ============================= SCHEDULE FETCHING (LIBRARY-BASED) =============================
-async def fetch_schedules_from_library() -> dict:
-    """
-    Fetches today's and tomorrow's confirmed schedules for the configured group
-    using the dtek-blackout-client library.
-    """
-    client = await get_dtek_client()
+# ============================= PARSING (FROM JSON MIRROR) =============================
+def day_to_slots(day: dict) -> list:
+    """Converts a day's schedule dict to a list of 48 emoji slots."""
+    slots = []
+    for h in range(1, 25):
+        v = day.get(str(h), "yes")
+        slots.append("🔴" if v in ("no", "first") else "🟢")
+        slots.append("🔴" if v in ("no", "second") else "🟢")
+    return slots
 
-    # We need to find an address that belongs to the target group.
-    # The library allows searching by address. For a group-based bot,
-    # we need a representative address. A common approach is to use the
-    # city/street/house that you know belongs to GPV4.1 in your region.
-    # **IMPORTANT**: You must replace these with a real address from your area
-    # that is assigned to GROUP (GPV4.1). The library's stub client can help you
-    # test with a known address (e.g., "м. Українка", "вул. Юності", "1").
-    # For production, use an address that actually maps to your group.
-    # You can use `client.get_streets` and `client.get_home_num` to discover
-    # the correct group_id for an address.
 
-    # Example using an address known to be in GPV4.1 from the library's stub data.
-    # **You must verify this address is correct for your specific region and group.**
-    city = "м. Українка"
-    street = "вул. Юності"
-    house_number = "1"
-
-    try:
-        today_slots = await client.get_today_schedule(city, street, house_number)
-        tomorrow_slots = await client.get_tomorrow_schedule(city, street, house_number)
-    except Exception as e:
-        logging.error(f"Failed to fetch schedules from library: {e}")
-        raise
-
-    now = now_kyiv()
-    today_date = now.date()
-    tomorrow_date = today_date + timedelta(days=1)
-
-    # Convert the library's SlotStatus dict into the format our bot uses.
-    def slots_to_internal(slot_dict: dict[str, SlotStatus]) -> dict:
-        """Converts a dict of time->SlotStatus into a list of emojis and a signature string."""
-        # The dict keys are times like "00:00", "00:30", etc.
-        # We sort them to ensure correct order.
-        sorted_times = sorted(slot_dict.keys())
-        emojis = []
-        for t in sorted_times:
-            status = slot_dict[t]
-            # Use the .has_outage property to decide: True = outage (red), False = power (green)
-            emojis.append("🔴" if status.has_outage else "🟢")
-
-        return {
-            "date": None,  # Will be set outside
-            "slots": emojis,
-            "sig": "".join(emojis),
+def parse_schedules_from_fact(fact: dict) -> dict:
+    """Parses the 'fact' object from the mirror JSON."""
+    result = {}
+    for ts, groups in (fact.get("data") or {}).items():
+        day = groups.get(GROUP)
+        if not day:
+            continue
+        slots = day_to_slots(day)
+        result[int(ts)] = {
+            "date": datetime.fromtimestamp(int(ts), TZ).date(),
+            "slots": slots,
+            "sig": "".join(slots),
         }
+    return dict(sorted(result.items()))
 
-    schedules = {}
 
-    if today_slots:
-        internal = slots_to_internal(today_slots)
-        internal["date"] = today_date
-        schedules[int(today_date.strftime("%s"))] = internal
+def day_title(d, now) -> str:
+    delta = (d - now.date()).days
+    label = {0: "на сегодня", 1: "на завтра"}.get(delta, "на")
+    return f"{label} {d.strftime('%d.%m.%Y')}"
 
-    if tomorrow_slots:
-        internal = slots_to_internal(tomorrow_slots)
-        internal["date"] = tomorrow_date
-        schedules[int(tomorrow_date.strftime("%s"))] = internal
 
-    return schedules
+# ============================= FETCHING & CACHE =============================
+async def fetch_fact_from_mirror() -> dict:
+    """Fetches the entire JSON blob from the public GitHub mirror."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(DATA_URL, timeout=20) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            fact = data.get("fact")
+            if not fact or "data" not in fact:
+                raise RuntimeError("Invalid 'fact' structure in mirror JSON.")
+            return fact
 
 
 async def get_snapshot(force=False):
@@ -165,33 +131,28 @@ async def get_snapshot(force=False):
             return _cache["snap"]
 
         try:
-            schedules = await fetch_schedules_from_library()
+            fact = await fetch_fact_from_mirror()
+            schedules = parse_schedules_from_fact(fact)
 
             if not schedules:
-                raise RuntimeError(f"Group {GROUP} not found in fetched schedules.")
-
-            # The library does not provide the "attention" text.
-            # We will use a default or you can implement a separate lightweight scraper
-            # for the attention banner if it is critical.
-            attention = DEFAULT_ATTENTION
+                raise RuntimeError(f"Group {GROUP} not found in mirror data.")
 
             snap = {
                 "schedules": schedules,
-                "updated": now_kyiv().strftime("%Y-%m-%d %H:%M:%S"),
-                "attention": attention,
+                "updated": fact.get("updateFact", "---"),
+                "attention": DEFAULT_ATTENTION,  # Mirror does not include attention text
             }
             _cache["ts"] = time.monotonic()
             _cache["snap"] = snap
             return snap
         except Exception as e:
-            # If a fresh fetch fails but we have a cached snapshot, return the cached one.
             if _cache["snap"]:
-                logging.warning("⚠️ Failed to fetch fresh data, using cache: %s", e)
+                logging.warning("⚠️ Mirror fetch failed, using cache: %s", e)
                 return _cache["snap"]
             raise e
 
 
-# ============================= TIME CALC & RENDERING (ADAPTED) =============================
+# ============================= TIME CALC & RENDERING =============================
 def h_str(h):
     return str(int(h)) if h % 1 == 0 else str(h)
 
@@ -204,6 +165,22 @@ def format_time(h, m):
     if m == 0:
         return f"{h}ч"
     return f"{h}ч {m} мин"
+
+
+def slots_to_text(slots: list, hour_offset: int = 0) -> str:
+    def fmt(i):
+        slot_index = (i + hour_offset * 2) % 48
+        m = slot_index * 30
+        return f"{(m // 60) % 24:02d}:{m % 60:02d}"
+
+    lines, start = [], 0
+    for i in range(1, 49):
+        if i == 48 or slots[i] != slots[start]:
+            if slots[start] == "🔴":
+                end = fmt(48) if i == 48 else fmt(i)
+                lines.append(f"🔴{fmt(start)} — {end}🔴")
+            start = i
+    return "\n".join(lines) or "🟢 Отключений нет"
 
 
 def calculate_time_left(schedules: dict) -> str:
@@ -242,28 +219,6 @@ def calculate_time_left(schedules: dict) -> str:
         res += (f" ↳ <b>Завтра</b>: 🔋 {h_str(tomorrow['slots'].count('🟢') / 2)} ч | "
                 f"🪫 {h_str(tomorrow['slots'].count('🔴') / 2)} ч\n")
     return res
-
-
-def slots_to_text(slots: list, hour_offset: int = 0) -> str:
-    def fmt(i):
-        slot_index = (i + hour_offset * 2) % 48
-        m = slot_index * 30
-        return f"{(m // 60) % 24:02d}:{m % 60:02d}"
-
-    lines, start = [], 0
-    for i in range(1, 49):
-        if i == 48 or slots[i] != slots[start]:
-            if slots[start] == "🔴":
-                end = fmt(48) if i == 48 else fmt(i)
-                lines.append(f"🔴{fmt(start)} — {end}🔴")
-            start = i
-    return "\n".join(lines) or "🟢 Отключений нет"
-
-
-def day_title(d, now) -> str:
-    delta = (d - now.date()).days
-    label = {0: "на сегодня", 1: "на завтра"}.get(delta, "на")
-    return f"{label} {d.strftime('%d.%m.%Y')}"
 
 
 def render_message(snap: dict, header: str, user_id=None) -> str:
@@ -331,7 +286,7 @@ async def monitoring_task():
                 changed = False
                 for ts, d in snap["schedules"].items():
                     key = f"sched2:{GROUP}:{ts}"
-                    old = await rcall(redis_client.get, key)
+                    old = _s(await rcall(redis_client.get, key))
 
                     if old is None or old != d["sig"]:
                         changed = True
@@ -446,7 +401,6 @@ async def main():
     finally:
         for t in background:
             t.cancel()
-        # The DtekClient manages its own resources; we don't need to stop a global browser here.
 
 
 if __name__ == "__main__":
