@@ -26,10 +26,8 @@ REDIS_HOST = os.getenv("REDIS_HOST")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 17778))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 
-# Group name must match exactly what is in the JSON (e.g., "GPV4.1")
 GROUP = os.getenv("GROUP", "GPV4.1")
 
-# Verified working URL for Kyiv Regional Network data
 DATA_URL = "https://raw.githubusercontent.com/Baskerville42/outage-data-ua/main/data/kyiv-region.json"
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))
@@ -65,7 +63,6 @@ redis_client = redis.Redis(
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Cache
 fetch_lock = asyncio.Lock()
 _cache = {"ts": 0.0, "snap": None}
 
@@ -82,26 +79,26 @@ async def rcall(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
-# ============================= PARSING (FROM JSON MIRROR) =============================
+# ============================= PARSING =============================
 def day_to_slots(day: dict) -> list:
-    """Converts a day's schedule dict to a list of 48 emoji slots."""
+    """48 slots per day (30 min each)."""
     slots = []
     for h in range(1, 25):
         v = day.get(str(h), "yes")
-        # "no", "first", and "second" all mean the power is OFF (red)
-        slots.append("🔴" if v in ("no", "first", "second") else "🟢")
-        slots.append("🔴" if v in ("no", "first", "second") else "🟢")
+        # "first"  = off 1st half-hour only
+        # "second" = off 2nd half-hour only
+        # "no"     = off whole hour
+        slots.append("🔴" if v in ("no", "first") else "🟢")
+        slots.append("🔴" if v in ("no", "second") else "🟢")
     return slots
 
 
 def parse_schedules_from_fact(fact: dict) -> dict:
-    """Parses the 'fact' object from the mirror JSON."""
     result = {}
     data_block = fact.get("data") or {}
     for ts, groups in data_block.items():
         day = groups.get(GROUP)
         if not day:
-            # Log which groups are available once, to help debug if GROUP is wrong
             if not result:
                 logging.debug("Available groups in first timestamp: %s", list(groups.keys())[:5])
             continue
@@ -122,13 +119,11 @@ def day_title(d, now) -> str:
 
 # ============================= FETCHING & CACHE =============================
 async def fetch_fact_from_mirror() -> dict:
-    """Fetches the entire JSON blob from the public GitHub mirror."""
     headers = {"User-Agent": "Mozilla/5.0 (compatible; OutageBot/1.0)"}
     async with aiohttp.ClientSession() as session:
         async with session.get(DATA_URL, timeout=20, headers=headers) as resp:
             logging.info("Mirror HTTP status: %s", resp.status)
             resp.raise_for_status()
-            # GitHub raw отдаёт JSON с Content-Type: text/plain — отключаем проверку mimetype
             data = await resp.json(content_type=None)
             fact = data.get("fact")
             if not fact or "data" not in fact:
@@ -161,7 +156,6 @@ async def get_snapshot(force=False):
             if _cache["snap"]:
                 logging.warning("⚠️ Mirror fetch failed, using cached snapshot: %s", e)
                 return _cache["snap"]
-            # Re-raise so the caller (manual handler) can log and notify the user
             raise e
 
 
@@ -270,7 +264,7 @@ def render_message(snap: dict, header: str, user_id=None) -> str:
     )
 
 
-# ============================= UI HELPERS =============================
+# ============================= UI =============================
 async def delete_message_after(message: types.Message, sleep_time: int):
     await asyncio.sleep(sleep_time)
     try:
@@ -300,14 +294,12 @@ async def monitoring_task():
                 for ts, d in snap["schedules"].items():
                     key = f"sched2:{GROUP}:{ts}"
                     old = _s(await rcall(redis_client.get, key))
-
                     if old is None or old != d["sig"]:
                         changed = True
-
                     await rcall(redis_client.set, key, d["sig"], ex=172800)
 
                 if changed:
-                    logging.info("📢 Schedule changed or new day added, notifying users")
+                    logging.info("📢 Schedule changed, notifying users")
                     builder = InlineKeyboardBuilder()
                     builder.row(types.InlineKeyboardButton(
                         text="🔹 Информация на сегодня", callback_data="show_att"))
@@ -323,7 +315,7 @@ async def monitoring_task():
                         except Exception as e:
                             logging.error("Broadcast to %s failed: %s", uid, e)
         except Exception as e:
-            logging.warning("⚠️ Monitoring loop error (will retry): %s", e)
+            logging.warning("⚠️ Monitoring loop error: %s", e)
         await asyncio.sleep(CHECK_INTERVAL)
 
 
@@ -344,9 +336,8 @@ async def manual(m: types.Message):
         try:
             snap = await get_snapshot()
         except Exception as e:
-            # CRITICAL: Log the real error so you can see it in the console
             logging.exception("Manual schedule fetch failed for user %s", m.from_user.id)
-            await m.answer("❌ <b>Ошибка:</b> график временно недоступен. Проверьте логи бота для деталей.", parse_mode="HTML")
+            await m.answer("❌ <b>Ошибка:</b> график временно недоступен. Проверьте логи.", parse_mode="HTML")
             return
 
     await m.answer(render_message(snap, "💡<b>ГРАФИК ОТКЛЮЧЕНИЙ</b>", user_id=m.from_user.id),
@@ -379,7 +370,7 @@ async def default_handler(m: types.Message):
     await m.answer("Пожалуйста, выберите действие из меню ниже:", reply_markup=get_kb())
 
 
-# ============================= WEB SERVER FOR UPTIMEROBOT =============================
+# ============================= WEB SERVER =============================
 async def handle_ping(request):
     return web.Response(text="Bot is alive and running!")
 
@@ -389,7 +380,6 @@ async def start_web_server():
     app.router.add_get("/health", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
